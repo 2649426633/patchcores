@@ -1,69 +1,262 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
 import pickle
+from typing import Optional
 
+import numpy as np
+from PIL import Image
 import torch
+from torchvision import transforms
 import torchvision.models as models
 
-import patchcore.backbones
 import patchcore.common
 import patchcore.patchcore
 import patchcore.sampler
 
 
-class PatchCoreAdapter:
-    """Project adapter for offline PatchCore loading."""
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
-    def __init__(self, device="cpu", config=None):
+
+@dataclass
+class PatchCoreConfig:
+    backbone_name: str = "wideresnet50"
+    layers: tuple[str, ...] = ("layer2", "layer3")
+    resize: int = 256
+    imagesize: int = 224
+    pretrain_embed_dimension: int = 1024
+    target_embed_dimension: int = 1024
+    patchsize: int = 3
+    patchstride: int = 1
+    anomaly_score_num_nn: int = 1
+    coreset_sampling_ratio: float = 0.1
+    faiss_on_gpu: bool = False
+    faiss_num_workers: int = 4
+
+
+class PatchCoreAdapter:
+    """Application adapter around the vendored PatchCore implementation.
+
+    The adapter keeps the official PatchCore core files unchanged while making
+    training and inference fully offline. WideResNet50-2 weights are loaded
+    from ``weights/wide_resnet50_2-95faca4d.pth``.
+    """
+
+    def __init__(
+        self,
+        device: Optional[str] = None,
+        config: Optional[PatchCoreConfig] = None,
+    ):
+        self.config = config or PatchCoreConfig()
+
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if str(device).startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but the current PyTorch environment "
+                "does not have an available CUDA device."
+            )
+
         self.device = torch.device(device)
-        self.config = config
-        self.model = None
+        self.model: Optional[patchcore.patchcore.PatchCore] = None
+
+    @property
+    def project_root(self) -> Path:
+        return Path(__file__).resolve().parents[2]
+
+    @property
+    def local_backbone_path(self) -> Path:
+        return (
+            self.project_root
+            / "weights"
+            / "wide_resnet50_2-95faca4d.pth"
+        )
 
     def _load_local_backbone(self):
-        root = Path(__file__).resolve().parents[2]
-        weight = root / "weights" / "wide_resnet50_2-95faca4d.pth"
+        weight_path = self.local_backbone_path
 
-        if not weight.exists():
-            raise FileNotFoundError(f"Missing local backbone: {weight}")
+        if not weight_path.exists():
+            raise FileNotFoundError(
+                "Missing local WideResNet50-2 weights:\n"
+                f"{weight_path}\n\n"
+                "Place wide_resnet50_2-95faca4d.pth in the project's "
+                "weights directory."
+            )
 
-        print(f"[PatchCore] Loading local backbone: {weight}")
+        print(f"[PatchCore] Loading local backbone: {weight_path}")
+
+        # Create the architecture only. weights=None guarantees no download.
         backbone = models.wide_resnet50_2(weights=None)
-        state = torch.load(weight, map_location="cpu")
-        backbone.load_state_dict(state, strict=True)
-        backbone.name = "wideresnet50"
+        state_dict = torch.load(weight_path, map_location="cpu")
+
+        # Some checkpoints are wrapped in a state_dict key. The official
+        # torchvision checkpoint is already a plain OrderedDict.
+        if (
+            isinstance(state_dict, dict)
+            and "state_dict" in state_dict
+            and isinstance(state_dict["state_dict"], dict)
+        ):
+            state_dict = state_dict["state_dict"]
+
+        backbone.load_state_dict(state_dict, strict=True)
+        backbone.name = self.config.backbone_name
+
+        print("[PatchCore] Local WideResNet50-2 weights loaded.")
         return backbone
 
-    def load(self, model_dir):
-        model_dir = Path(model_dir)
-        params = model_dir / "patchcore_params.pkl"
+    def _build_nn_method(self):
+        return patchcore.common.FaissNN(
+            on_gpu=self.config.faiss_on_gpu,
+            num_workers=self.config.faiss_num_workers,
+        )
 
-        with open(params, "rb") as f:
-            cfg = pickle.load(f)
-
+    def _new_model(self) -> patchcore.patchcore.PatchCore:
+        cfg = self.config
         backbone = self._load_local_backbone()
 
-        nn_method = patchcore.common.FaissNN(
-            on_gpu=False,
-            num_workers=4,
-        )
-
-        self.model = patchcore.patchcore.PatchCore(self.device)
-        self.model.load(
-            backbone=backbone,
-            layers_to_extract_from=cfg["layers_to_extract_from"],
+        sampler = patchcore.sampler.ApproximateGreedyCoresetSampler(
+            percentage=cfg.coreset_sampling_ratio,
             device=self.device,
-            input_shape=cfg["input_shape"],
-            pretrain_embed_dimension=cfg["pretrain_embed_dimension"],
-            target_embed_dimension=cfg["target_embed_dimension"],
-            patchsize=cfg["patchsize"],
-            patchstride=cfg["patchstride"],
-            anomaly_score_num_nn=cfg["anomaly_scorer_num_nn"],
-            nn_method=nn_method,
         )
 
-        self.model.anomaly_scorer.load(str(model_dir))
+        model = patchcore.patchcore.PatchCore(self.device)
+        model.load(
+            backbone=backbone,
+            layers_to_extract_from=list(cfg.layers),
+            device=self.device,
+            input_shape=(3, cfg.imagesize, cfg.imagesize),
+            pretrain_embed_dimension=cfg.pretrain_embed_dimension,
+            target_embed_dimension=cfg.target_embed_dimension,
+            patchsize=cfg.patchsize,
+            patchstride=cfg.patchstride,
+            anomaly_score_num_nn=cfg.anomaly_score_num_nn,
+            featuresampler=sampler,
+            nn_method=self._build_nn_method(),
+        )
+        return model
+
+    def fit(self, training_data) -> None:
+        """Build the normal-image PatchCore memory bank from a DataLoader."""
+        print(f"[PatchCore] device: {self.device}")
+        self.model = self._new_model()
+        self.model.fit(training_data)
+
+    def save(self, model_dir: str | Path) -> Path:
+        if self.model is None:
+            raise RuntimeError("Model is not fitted or loaded; cannot save.")
+
+        model_dir = Path(model_dir)
+        model_dir.mkdir(parents=True, exist_ok=True)
+        self.model.save_to_path(str(model_dir))
+        print(f"[PatchCore] Model saved: {model_dir.resolve()}")
+        return model_dir
+
+    def load(self, model_dir: str | Path) -> None:
+        """Load PatchCore fully offline without calling backbones.load()."""
+        model_dir = Path(model_dir)
+        params_file = model_dir / "patchcore_params.pkl"
+        index_file = model_dir / "nnscorer_search_index.faiss"
+
+        missing = [p for p in (params_file, index_file) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "Incomplete PatchCore model directory. Missing:\n"
+                + "\n".join(str(p) for p in missing)
+            )
+
+        print(f"[PatchCore] Loading model directory: {model_dir.resolve()}")
+
+        with open(params_file, "rb") as f:
+            saved = pickle.load(f)
+
+        backbone = self._load_local_backbone()
+        backbone.name = saved.get("backbone.name", self.config.backbone_name)
+
+        model = patchcore.patchcore.PatchCore(self.device)
+        model.load(
+            backbone=backbone,
+            layers_to_extract_from=saved["layers_to_extract_from"],
+            device=self.device,
+            input_shape=saved["input_shape"],
+            pretrain_embed_dimension=saved["pretrain_embed_dimension"],
+            target_embed_dimension=saved["target_embed_dimension"],
+            patchsize=saved["patchsize"],
+            patchstride=saved["patchstride"],
+            anomaly_score_num_nn=saved["anomaly_scorer_num_nn"],
+            nn_method=self._build_nn_method(),
+        )
+        model.anomaly_scorer.load(str(model_dir))
+
+        self.model = model
+
+        loaded_h = int(self.model.input_shape[-2])
+        loaded_w = int(self.model.input_shape[-1])
+        if loaded_h != loaded_w:
+            raise RuntimeError(
+                "The current application adapter supports square PatchCore "
+                f"inputs only, but the saved model uses {loaded_h}x{loaded_w}."
+            )
+        self.config.imagesize = loaded_h
+
+        print("[PatchCore] FAISS memory bank loaded.")
         print("[PatchCore] Offline model loaded.")
 
-    def predict(self, image):
+    def _image_transform(self):
+        return transforms.Compose(
+            [
+                transforms.Resize(self.config.resize),
+                transforms.CenterCrop(self.config.imagesize),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=IMAGENET_MEAN,
+                    std=IMAGENET_STD,
+                ),
+            ]
+        )
+
+    def _load_image_tensor(self, image_path: str | Path) -> torch.Tensor:
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        image = Image.open(image_path).convert("RGB")
+        tensor = self._image_transform()(image)
+        return tensor.unsqueeze(0)
+
+    def predict(self, image) -> dict:
+        """Predict one image path/PIL image/tensor and return app-friendly data."""
         if self.model is None:
-            raise RuntimeError("Model is not loaded")
-        return self.model.predict(image)
+            raise RuntimeError("Model is not loaded. Call load() or fit() first.")
+
+        image_path = None
+
+        if isinstance(image, (str, Path)):
+            image_path = str(image)
+            image_tensor = self._load_image_tensor(image)
+        elif isinstance(image, Image.Image):
+            image_tensor = self._image_transform()(image.convert("RGB")).unsqueeze(0)
+        elif torch.is_tensor(image):
+            image_tensor = image
+            if image_tensor.ndim == 3:
+                image_tensor = image_tensor.unsqueeze(0)
+        else:
+            raise TypeError(
+                "predict() expects an image path, PIL.Image, or torch.Tensor."
+            )
+
+        scores, masks = self.model.predict(image_tensor)
+
+        if len(scores) != 1 or len(masks) != 1:
+            raise RuntimeError(
+                "Single-image prediction returned an unexpected number of "
+                f"results: scores={len(scores)}, masks={len(masks)}"
+            )
+
+        return {
+            "image_path": image_path,
+            "anomaly_score": float(np.asarray(scores[0]).item()),
+            "anomaly_map": np.asarray(masks[0], dtype=np.float32),
+        }
