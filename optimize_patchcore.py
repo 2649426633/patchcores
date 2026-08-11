@@ -51,6 +51,13 @@ def run_command(command: list[str]) -> int:
     return int(completed.returncode)
 
 
+def model_is_complete(model_dir: Path) -> bool:
+    return (
+        (model_dir / "patchcore_params.pkl").is_file()
+        and (model_dir / "nnscorer_search_index.faiss").is_file()
+    )
+
+
 def evaluate_model(
     model_dir: Path,
     output_dir: Path,
@@ -234,18 +241,24 @@ def main():
         print("=" * 70)
 
         if experiment["train"]:
-            if model_dir.exists():
-                print(f"已有实验模型，跳过训练: {model_dir}")
+            if model_is_complete(model_dir):
+                print(f"已有完整实验模型，跳过训练: {model_dir}")
             else:
+                if model_dir.exists():
+                    print(f"发现不完整实验模型，删除后重训: {model_dir}")
+                    shutil.rmtree(model_dir)
                 ok = train_model(
                     model_dir=model_dir,
                     imagesize=experiment["imagesize"],
                     layers=experiment["layers"],
                     args=args,
                 )
-                if not ok:
-                    print(f"训练失败，跳过实验: {name}")
+                if not ok or not model_is_complete(model_dir):
+                    print(f"训练失败或模型文件不完整，跳过实验: {name}")
                     continue
+        elif not model_is_complete(model_dir):
+            print(f"基线模型不完整，跳过实验: {model_dir}")
+            continue
 
         csv_path = evaluate_model(model_dir, eval_dir, args)
         if csv_path is None:
