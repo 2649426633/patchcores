@@ -20,6 +20,21 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", default=None, help="cpu, cuda or cuda:0")
     parser.add_argument("--coreset", type=float, default=0.1)
+    parser.add_argument(
+        "--imagesize",
+        type=int,
+        default=224,
+        help="PatchCore square input/crop size. Baseline: 224; high-resolution experiment: 320.",
+    )
+    parser.add_argument(
+        "--resize",
+        type=int,
+        default=None,
+        help=(
+            "Resize shorter side before center crop. If omitted, keeps the baseline "
+            "256/224 ratio automatically (224->256, 320->366)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -31,7 +46,26 @@ def main():
             f"Normal training directory not found: {normal_dir.resolve()}"
         )
 
-    config = PatchCoreConfig(coreset_sampling_ratio=args.coreset)
+    if args.imagesize <= 0:
+        raise ValueError("--imagesize must be > 0")
+
+    resize = args.resize
+    if resize is None:
+        resize = max(
+            args.imagesize,
+            int(round(args.imagesize * (256.0 / 224.0))),
+        )
+
+    if resize < args.imagesize:
+        raise ValueError(
+            f"--resize ({resize}) must be >= --imagesize ({args.imagesize})"
+        )
+
+    config = PatchCoreConfig(
+        resize=resize,
+        imagesize=args.imagesize,
+        coreset_sampling_ratio=args.coreset,
+    )
     detector = PatchCoreAdapter(device=args.device, config=config)
 
     loader = create_normal_dataloader(
@@ -42,7 +76,16 @@ def main():
         imagesize=config.imagesize,
     )
 
-    print(f"[PatchCore] 正常图片数量: {len(loader.dataset)}")
+    print("========== PatchCore 训练配置 ==========")
+    print(f"正常图片目录: {normal_dir.resolve()}")
+    print(f"正常图片数量: {len(loader.dataset)}")
+    print(f"resize: {config.resize}")
+    print(f"imagesize: {config.imagesize}")
+    print(f"layers: {config.layers}")
+    print(f"coreset: {config.coreset_sampling_ratio}")
+    print(f"模型输出: {Path(args.model_dir).resolve()}")
+    print("======================================")
+
     print("[PatchCore] 正在建立 Memory Bank ...")
     detector.fit(loader)
     detector.save(args.model_dir)
