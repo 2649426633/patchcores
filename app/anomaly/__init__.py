@@ -1,3 +1,3 @@
-from .patchcore_adapter import PatchCoreAdapter
+from .patchcore_adapter import PatchCoreAdapter, PatchCoreConfig
 
-__all__ = ["PatchCoreAdapter"]
+__all__ = ["PatchCoreAdapter", "PatchCoreConfig"]
