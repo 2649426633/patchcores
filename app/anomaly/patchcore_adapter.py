@@ -88,12 +88,9 @@ class PatchCoreAdapter:
 
         print(f"[PatchCore] Loading local backbone: {weight_path}")
 
-        # Create the architecture only. weights=None guarantees no download.
         backbone = models.wide_resnet50_2(weights=None)
         state_dict = torch.load(weight_path, map_location="cpu")
 
-        # Some checkpoints are wrapped in a state_dict key. The official
-        # torchvision checkpoint is already a plain OrderedDict.
         if (
             isinstance(state_dict, dict)
             and "state_dict" in state_dict
@@ -139,7 +136,6 @@ class PatchCoreAdapter:
         return model
 
     def fit(self, training_data) -> None:
-        """Build the normal-image PatchCore memory bank from a DataLoader."""
         print(f"[PatchCore] device: {self.device}")
         self.model = self._new_model()
         self.model.fit(training_data)
@@ -199,8 +195,21 @@ class PatchCoreAdapter:
                 "The current application adapter supports square PatchCore "
                 f"inputs only, but the saved model uses {loaded_h}x{loaded_w}."
             )
+
         self.config.imagesize = loaded_h
 
+        # Keep the same Resize -> CenterCrop ratio used by the baseline
+        # 256 -> 224 pipeline. This also makes separately trained high-resolution
+        # models (for example 366 -> 320) load with matching preprocessing.
+        self.config.resize = max(
+            loaded_h,
+            int(round(loaded_h * (256.0 / 224.0))),
+        )
+
+        print(
+            f"[PatchCore] Preprocessing restored: "
+            f"resize={self.config.resize}, imagesize={self.config.imagesize}"
+        )
         print("[PatchCore] FAISS memory bank loaded.")
         print("[PatchCore] Offline model loaded.")
 
@@ -227,7 +236,6 @@ class PatchCoreAdapter:
         return tensor.unsqueeze(0)
 
     def predict(self, image) -> dict:
-        """Predict one image path/PIL image/tensor and return app-friendly data."""
         if self.model is None:
             raise RuntimeError("Model is not loaded. Call load() or fit() first.")
 
