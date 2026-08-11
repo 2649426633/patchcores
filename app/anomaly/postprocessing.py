@@ -1,5 +1,4 @@
 from pathlib import Path
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -24,60 +23,83 @@ def save_heatmap(anomaly_map, output_path):
     return output_path
 
 
-def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
-    """Return connected anomaly regions ranked by anomaly evidence.
-
-    The previous implementation selected the largest contour. That can prefer a
-    broad background/border response over a smaller but much hotter real defect.
-    Here we lightly denoise the thresholded map and rank every valid component by
-    peak/high-percentile/mean anomaly strength. Border-touching components receive
-    only a small penalty instead of being discarded, so real edge defects remain
-    detectable.
-    """
+def _prepare_regions(anomaly_map, relative_threshold=0.70):
+    """Prepare a lightly denoised binary anomaly map and connected components."""
     norm = normalize_anomaly_map(anomaly_map)
 
-    # PatchCore already smooths the anomaly map; this very small extra blur only
-    # suppresses isolated pixel-scale spikes before connected-component analysis.
-    smooth = cv2.GaussianBlur(norm, (0, 0), sigmaX=1.0, sigmaY=1.0)
-    binary = (smooth >= relative_threshold).astype(np.uint8) * 255
+    # Keep smoothing weak so small industrial defects are not erased.
+    smooth = cv2.GaussianBlur(norm, (0, 0), sigmaX=0.8, sigmaY=0.8)
+    binary = (smooth >= relative_threshold).astype(np.uint8)
 
+    # Close tiny gaps inside one hot region. Do not use MORPH_OPEN here because
+    # opening can remove narrow scratches or thin thread defects.
     kernel = np.ones((3, 3), dtype=np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    return norm, smooth, binary, num_labels, labels, stats
+
+
+def _component_bbox(stats, label):
+    x = int(stats[label, cv2.CC_STAT_LEFT])
+    y = int(stats[label, cv2.CC_STAT_TOP])
+    w = int(stats[label, cv2.CC_STAT_WIDTH])
+    h = int(stats[label, cv2.CC_STAT_HEIGHT])
+    return x, y, x + w, y + h
+
+
+def _distance_point_to_component(labels, label, px, py):
+    ys, xs = np.where(labels == label)
+    if xs.size == 0:
+        return float("inf")
+    dx = xs.astype(np.float32) - float(px)
+    dy = ys.astype(np.float32) - float(py)
+    return float(np.sqrt(np.min(dx * dx + dy * dy)))
+
+
+def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
+    """Return valid connected anomaly regions ranked by anomaly evidence.
+
+    This remains the fallback strategy. Normal localization now first tries the
+    component nearest the global PatchCore anomaly peak, because evaluation on
+    MVTec screw showed cases where the peak was inside the real defect but an
+    evidence-ranked component elsewhere was selected as the final bbox.
+    """
+    norm, smooth, _, num_labels, labels, stats = _prepare_regions(
+        anomaly_map,
+        relative_threshold=relative_threshold,
+    )
+
+    if num_labels <= 1:
         return []
 
     h, w = smooth.shape[:2]
     candidates = []
 
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
         if area < min_area:
             continue
 
-        x, y, bw, bh = cv2.boundingRect(contour)
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.drawContours(mask, [contour], contourIdx=-1, color=1, thickness=-1)
-        values = smooth[mask.astype(bool)]
+        component_mask = labels == label
+        values = smooth[component_mask]
         if values.size == 0:
             continue
 
         peak = float(values.max())
         q90 = float(np.quantile(values, 0.90))
         mean = float(values.mean())
-
-        # Prefer genuinely hot regions over merely large ones.
         evidence = 0.55 * peak + 0.30 * q90 + 0.15 * mean
 
-        touches_border = x <= 1 or y <= 1 or (x + bw) >= (w - 1) or (y + bh) >= (h - 1)
+        x1, y1, x2, y2 = _component_bbox(stats, label)
+        touches_border = x1 <= 1 or y1 <= 1 or x2 >= (w - 1) or y2 >= (h - 1)
         if touches_border:
             evidence *= 0.92
 
         candidates.append(
             {
-                "bbox": (int(x), int(y), int(x + bw), int(y + bh)),
+                "label": label,
+                "bbox": (x1, y1, x2, y2),
                 "area": area,
                 "peak": peak,
                 "q90": q90,
@@ -94,12 +116,54 @@ def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
     return candidates
 
 
-def extract_bbox_from_map(anomaly_map, relative_threshold=0.70, min_area=10):
-    """Extract the strongest candidate defect box from an anomaly map.
+def extract_bbox_from_map(
+    anomaly_map,
+    relative_threshold=0.70,
+    min_area=10,
+    peak_max_distance=8.0,
+):
+    """Extract a defect bbox using the global anomaly peak as the primary anchor.
 
-    This threshold is for localization visualization only. It is not the final
-    PASS/NG decision threshold.
+    Strategy:
+    1. Find the global maximum in the original normalized PatchCore anomaly map.
+    2. Threshold a lightly smoothed map and build connected components.
+    3. Prefer the valid component containing, or nearest to, that global peak.
+    4. Fall back to anomaly-evidence ranking only when no valid component is near
+       the peak.
+
+    ``relative_threshold`` is for localization visualization only. It is not the
+    final image-level PASS/NG threshold.
     """
+    norm, _, _, num_labels, labels, stats = _prepare_regions(
+        anomaly_map,
+        relative_threshold=relative_threshold,
+    )
+
+    peak_index = int(np.argmax(norm))
+    peak_y, peak_x = np.unravel_index(peak_index, norm.shape)
+
+    nearest = None
+    nearest_distance = float("inf")
+
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+
+        if labels[peak_y, peak_x] == label:
+            return _component_bbox(stats, label)
+
+        distance = _distance_point_to_component(labels, label, peak_x, peak_y)
+        if distance < nearest_distance:
+            nearest_distance = distance
+            nearest = label
+
+    # A small tolerance handles sub-pixel/blur shifts between the original map
+    # peak and the thresholded smoothed component without letting distant hot
+    # regions steal the bbox.
+    if nearest is not None and nearest_distance <= peak_max_distance:
+        return _component_bbox(stats, nearest)
+
     candidates = _candidate_regions(
         anomaly_map,
         relative_threshold=relative_threshold,
