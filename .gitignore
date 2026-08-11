@@ -1,0 +1,29 @@
+# PyCharm
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Model / cache
+*.pth
+*.pt
+*.ckpt
+
+# Dataset
+products/*/normal/
+products/*/test/
+
+# Outputs
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
