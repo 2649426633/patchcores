@@ -27,3 +27,20 @@ outputs/
 # OS
 .DS_Store
 Thumbs.db
+# Local datasets
+/data/
+
+# IDE
+/.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated models
+outputs/
+checkpoints/
+*.faiss
+*.pkl
+*.pth
+*.pt
