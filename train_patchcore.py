@@ -35,6 +35,15 @@ def parse_args():
             "256/224 ratio automatically (224->256, 320->366)."
         ),
     )
+    parser.add_argument(
+        "--layers",
+        nargs="+",
+        default=["layer2", "layer3"],
+        help=(
+            "Backbone feature layers used by PatchCore. Baseline: layer2 layer3. "
+            "For finer texture experiments use: --layers layer1 layer2"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -61,7 +70,15 @@ def main():
             f"--resize ({resize}) must be >= --imagesize ({args.imagesize})"
         )
 
+    valid_layers = {"layer1", "layer2", "layer3", "layer4"}
+    invalid_layers = [layer for layer in args.layers if layer not in valid_layers]
+    if invalid_layers:
+        raise ValueError(
+            f"Unsupported --layers: {invalid_layers}. Valid choices: {sorted(valid_layers)}"
+        )
+
     config = PatchCoreConfig(
+        layers=tuple(args.layers),
         resize=resize,
         imagesize=args.imagesize,
         coreset_sampling_ratio=args.coreset,
