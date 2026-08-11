@@ -24,17 +24,90 @@ def save_heatmap(anomaly_map, output_path):
     return output_path
 
 
-def extract_bbox_from_map(anomaly_map, relative_threshold=0.70, min_area=10):
+def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
+    """Return connected anomaly regions ranked by anomaly evidence.
+
+    The previous implementation selected the largest contour. That can prefer a
+    broad background/border response over a smaller but much hotter real defect.
+    Here we lightly denoise the thresholded map and rank every valid component by
+    peak/high-percentile/mean anomaly strength. Border-touching components receive
+    only a small penalty instead of being discarded, so real edge defects remain
+    detectable.
+    """
     norm = normalize_anomaly_map(anomaly_map)
-    binary = (norm >= relative_threshold).astype(np.uint8) * 255
+
+    # PatchCore already smooths the anomaly map; this very small extra blur only
+    # suppresses isolated pixel-scale spikes before connected-component analysis.
+    smooth = cv2.GaussianBlur(norm, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    binary = (smooth >= relative_threshold).astype(np.uint8) * 255
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
+        return []
+
+    h, w = smooth.shape[:2]
+    candidates = []
+
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(contour)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(mask, [contour], contourIdx=-1, color=1, thickness=-1)
+        values = smooth[mask.astype(bool)]
+        if values.size == 0:
+            continue
+
+        peak = float(values.max())
+        q90 = float(np.quantile(values, 0.90))
+        mean = float(values.mean())
+
+        # Prefer genuinely hot regions over merely large ones.
+        evidence = 0.55 * peak + 0.30 * q90 + 0.15 * mean
+
+        touches_border = x <= 1 or y <= 1 or (x + bw) >= (w - 1) or (y + bh) >= (h - 1)
+        if touches_border:
+            evidence *= 0.92
+
+        candidates.append(
+            {
+                "bbox": (int(x), int(y), int(x + bw), int(y + bh)),
+                "area": area,
+                "peak": peak,
+                "q90": q90,
+                "mean": mean,
+                "touches_border": touches_border,
+                "evidence": evidence,
+            }
+        )
+
+    candidates.sort(
+        key=lambda item: (item["evidence"], item["peak"], item["q90"], item["area"]),
+        reverse=True,
+    )
+    return candidates
+
+
+def extract_bbox_from_map(anomaly_map, relative_threshold=0.70, min_area=10):
+    """Extract the strongest candidate defect box from an anomaly map.
+
+    This threshold is for localization visualization only. It is not the final
+    PASS/NG decision threshold.
+    """
+    candidates = _candidate_regions(
+        anomaly_map,
+        relative_threshold=relative_threshold,
+        min_area=min_area,
+    )
+    if not candidates:
         return None
-    contour = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(contour) < min_area:
-        return None
-    x, y, w, h = cv2.boundingRect(contour)
-    return int(x), int(y), int(x + w), int(y + h)
+    return candidates[0]["bbox"]
 
 
 def save_overlay_with_bbox(
