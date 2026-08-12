@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,7 @@ from torchvision import transforms
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+FEATURE_MODES = ("cls", "patch_mean", "patch_center")
 
 
 @dataclass
@@ -22,14 +24,16 @@ class DINOv2Config:
     embedding_dim: int = 384
     repo_dir: str = "third_party/dinov2"
     weights_path: str = "weights/dinov2_vits14_pretrain.pth"
+    center_fraction: float = 0.50
 
 
 class DINOv2Adapter:
     """Frozen DINOv2 feature extractor for few-shot defect recognition.
 
-    The first engineering version uses DINOv2 ViT-S/14 only. It loads the
-    official DINOv2 source tree and pretrained weights from local disk so the
-    production path does not depend on internet access.
+    The engineering default remains the DINOv2 ViT-S/14 CLS token. For local
+    industrial defects, ``patch_mean`` and ``patch_center`` expose alternative
+    embeddings derived from DINOv2's normalized patch tokens without changing
+    or fine-tuning the backbone.
     """
 
     def __init__(
@@ -127,14 +131,76 @@ class DINOv2Adapter:
         tensor = self._transform()(pil_image)
         return tensor.unsqueeze(0).to(self.device)
 
+    def _pool_patch_tokens(
+        self,
+        patch_tokens: torch.Tensor,
+        feature_mode: str,
+        center_fraction: float,
+    ) -> torch.Tensor:
+        if patch_tokens.ndim != 3 or patch_tokens.shape[0] != 1:
+            raise RuntimeError(
+                f"Unexpected patch-token shape: {tuple(patch_tokens.shape)}"
+            )
+
+        if feature_mode == "patch_mean":
+            return patch_tokens.mean(dim=1)
+
+        if feature_mode != "patch_center":
+            raise ValueError(f"Unsupported patch feature mode: {feature_mode}")
+
+        n_tokens = int(patch_tokens.shape[1])
+        grid = int(round(math.sqrt(n_tokens)))
+        if grid * grid != n_tokens:
+            raise RuntimeError(
+                "patch_center expects a square token grid, but got "
+                f"{n_tokens} patch tokens"
+            )
+
+        fraction = float(center_fraction)
+        if not (0.0 < fraction <= 1.0):
+            raise ValueError("center_fraction must be in (0, 1]")
+
+        keep = max(1, min(grid, int(round(grid * fraction))))
+        start = (grid - keep) // 2
+        end = start + keep
+
+        grid_tokens = patch_tokens.reshape(1, grid, grid, patch_tokens.shape[-1])
+        center_tokens = grid_tokens[:, start:end, start:end, :]
+        return center_tokens.reshape(1, -1, patch_tokens.shape[-1]).mean(dim=1)
+
     @torch.inference_mode()
-    def embed(self, image: str | Path | Image.Image) -> np.ndarray:
+    def embed(
+        self,
+        image: str | Path | Image.Image,
+        feature_mode: str = "cls",
+        center_fraction: Optional[float] = None,
+    ) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("DINOv2 is not loaded. Call load() first.")
 
+        feature_mode = str(feature_mode).strip().lower()
+        if feature_mode not in FEATURE_MODES:
+            raise ValueError(
+                f"feature_mode must be one of {FEATURE_MODES}, got {feature_mode!r}"
+            )
+
         tensor = self._prepare_image(image)
         features = self.model.forward_features(tensor)
-        embedding = features["x_norm_clstoken"]
+
+        if feature_mode == "cls":
+            embedding = features["x_norm_clstoken"]
+        else:
+            patch_tokens = features["x_norm_patchtokens"]
+            embedding = self._pool_patch_tokens(
+                patch_tokens,
+                feature_mode=feature_mode,
+                center_fraction=(
+                    self.config.center_fraction
+                    if center_fraction is None
+                    else float(center_fraction)
+                ),
+            )
+
         embedding = F.normalize(embedding, p=2, dim=-1)
 
         if embedding.ndim != 2 or embedding.shape[0] != 1:
