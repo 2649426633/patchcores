@@ -31,6 +31,8 @@ class PatchCoreDINOv2Pipeline:
         bbox_relative_threshold: float = 0.80,
         roi_margin: float = 0.50,
         fallback_side_ratio: float = 0.18,
+        dinov2_feature_mode: str = "cls",
+        center_fraction: float = 0.50,
     ):
         self.patchcore_model_dir = Path(patchcore_model_dir)
         self.bank_dir = Path(bank_dir) if bank_dir is not None else None
@@ -38,6 +40,8 @@ class PatchCoreDINOv2Pipeline:
         self.bbox_relative_threshold = float(bbox_relative_threshold)
         self.roi_margin = float(roi_margin)
         self.fallback_side_ratio = float(fallback_side_ratio)
+        self.dinov2_feature_mode = str(dinov2_feature_mode).strip().lower()
+        self.center_fraction = float(center_fraction)
 
         self.patchcore: Optional[PatchCoreAdapter] = None
         self.dinov2: Optional[DINOv2Adapter] = None
@@ -194,10 +198,23 @@ class PatchCoreDINOv2Pipeline:
             "roi": roi,
         }
 
-    def embed_roi(self, roi: Image.Image) -> np.ndarray:
+    def embed_roi(
+        self,
+        roi: Image.Image,
+        feature_mode: Optional[str] = None,
+        center_fraction: Optional[float] = None,
+    ) -> np.ndarray:
         if self.dinov2 is None:
             raise RuntimeError("Pipeline is not loaded. Call load() first.")
-        return self.dinov2.embed(roi)
+        return self.dinov2.embed(
+            roi,
+            feature_mode=(
+                self.dinov2_feature_mode if feature_mode is None else feature_mode
+            ),
+            center_fraction=(
+                self.center_fraction if center_fraction is None else center_fraction
+            ),
+        )
 
     def classify(self, image_path: str | Path) -> dict:
         if self.bank is None:
