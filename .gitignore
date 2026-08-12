@@ -44,3 +44,6 @@ checkpoints/
 *.pkl
 *.pth
 *.pt
+
+# Local third-party source used only for offline DINOv2 loading
+/third_party/dinov2/
