@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import pickle
 from typing import Optional
@@ -18,6 +19,7 @@ import patchcore.sampler
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+ADAPTER_CONFIG_FILENAME = "patchcore_adapter_config.json"
 
 
 @dataclass
@@ -69,11 +71,7 @@ class PatchCoreAdapter:
 
     @property
     def local_backbone_path(self) -> Path:
-        return (
-            self.project_root
-            / "weights"
-            / "wide_resnet50_2-95faca4d.pth"
-        )
+        return self.project_root / "weights" / "wide_resnet50_2-95faca4d.pth"
 
     def _load_local_backbone(self):
         weight_path = self.local_backbone_path
@@ -147,6 +145,16 @@ class PatchCoreAdapter:
         model_dir = Path(model_dir)
         model_dir.mkdir(parents=True, exist_ok=True)
         self.model.save_to_path(str(model_dir))
+
+        adapter_config = {
+            "format_version": 1,
+            "resize": int(self.config.resize),
+            "imagesize": int(self.config.imagesize),
+            "layers": list(self.config.layers),
+        }
+        with open(model_dir / ADAPTER_CONFIG_FILENAME, "w", encoding="utf-8") as f:
+            json.dump(adapter_config, f, ensure_ascii=False, indent=2)
+
         print(f"[PatchCore] Model saved: {model_dir.resolve()}")
         return model_dir
 
@@ -155,6 +163,7 @@ class PatchCoreAdapter:
         model_dir = Path(model_dir)
         params_file = model_dir / "patchcore_params.pkl"
         index_file = model_dir / "nnscorer_search_index.faiss"
+        adapter_config_file = model_dir / ADAPTER_CONFIG_FILENAME
 
         missing = [p for p in (params_file, index_file) if not p.exists()]
         if missing:
@@ -185,7 +194,6 @@ class PatchCoreAdapter:
             nn_method=self._build_nn_method(),
         )
         model.anomaly_scorer.load(str(model_dir))
-
         self.model = model
 
         loaded_h = int(self.model.input_shape[-2])
@@ -197,18 +205,36 @@ class PatchCoreAdapter:
             )
 
         self.config.imagesize = loaded_h
+        self.config.layers = tuple(saved["layers_to_extract_from"])
 
-        # Keep the same Resize -> CenterCrop ratio used by the baseline
-        # 256 -> 224 pipeline. This also makes separately trained high-resolution
-        # models (for example 366 -> 320) load with matching preprocessing.
-        self.config.resize = max(
-            loaded_h,
-            int(round(loaded_h * (256.0 / 224.0))),
-        )
+        if adapter_config_file.exists():
+            with open(adapter_config_file, "r", encoding="utf-8") as f:
+                adapter_config = json.load(f)
+
+            saved_imagesize = int(adapter_config.get("imagesize", loaded_h))
+            if saved_imagesize != loaded_h:
+                raise RuntimeError(
+                    "Adapter preprocessing metadata does not match PatchCore input shape: "
+                    f"metadata imagesize={saved_imagesize}, model imagesize={loaded_h}."
+                )
+
+            self.config.resize = int(adapter_config["resize"])
+            if "layers" in adapter_config:
+                self.config.layers = tuple(adapter_config["layers"])
+            metadata_source = ADAPTER_CONFIG_FILENAME
+        else:
+            # Backward compatibility for models saved before exact preprocessing
+            # metadata was persisted. Legacy project models used the 256/224 ratio.
+            self.config.resize = max(
+                loaded_h,
+                int(round(loaded_h * (256.0 / 224.0))),
+            )
+            metadata_source = "legacy inferred resize"
 
         print(
             f"[PatchCore] Preprocessing restored: "
-            f"resize={self.config.resize}, imagesize={self.config.imagesize}"
+            f"resize={self.config.resize}, imagesize={self.config.imagesize} "
+            f"({metadata_source})"
         )
         print("[PatchCore] FAISS memory bank loaded.")
         print("[PatchCore] Offline model loaded.")
@@ -219,10 +245,7 @@ class PatchCoreAdapter:
                 transforms.Resize(self.config.resize),
                 transforms.CenterCrop(self.config.imagesize),
                 transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=IMAGENET_MEAN,
-                    std=IMAGENET_STD,
-                ),
+                transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ]
         )
 
