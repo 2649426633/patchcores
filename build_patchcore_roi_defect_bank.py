@@ -25,7 +25,12 @@ def parse_args():
         "--bank-dir",
         default="products/screw/defects/bank_patchcore_roi_3shot",
     )
-    parser.add_argument("--shots", type=int, default=3)
+    parser.add_argument(
+        "--shots",
+        type=int,
+        default=3,
+        help="Number of samples used per class. Use 0 to include every available sample in each class.",
+    )
     parser.add_argument("--device", default=None, help="cpu, cuda or cuda:0")
     parser.add_argument("--bbox-relative-threshold", type=float, default=0.80)
     parser.add_argument("--roi-margin", type=float, default=0.50)
@@ -43,8 +48,8 @@ def build_bank(args) -> DefectExemplarBank:
     samples_dir = Path(args.samples_dir)
     bank_dir = Path(args.bank_dir)
 
-    if args.shots <= 0:
-        raise ValueError("--shots must be > 0")
+    if args.shots < 0:
+        raise ValueError("--shots must be >= 0; use 0 for all available samples")
     if not samples_dir.exists():
         raise FileNotFoundError(samples_dir)
 
@@ -67,16 +72,20 @@ def build_bank(args) -> DefectExemplarBank:
     embeddings = []
     labels = []
     source_paths = []
+    class_counts = {}
 
     print("\n========== PatchCore ROI few-shot support ==========")
     for class_dir in class_dirs:
         images = image_files(class_dir)
-        if len(images) < args.shots:
+        if not images:
+            raise RuntimeError(f"Class {class_dir.name} has no supported images")
+        if args.shots > 0 and len(images) < args.shots:
             raise RuntimeError(
                 f"Class {class_dir.name} has {len(images)} images, fewer than shots={args.shots}"
             )
 
-        chosen = images[: args.shots]
+        chosen = images if args.shots == 0 else images[: args.shots]
+        class_counts[class_dir.name] = len(chosen)
         print(f"{class_dir.name}: {len(chosen)} support images")
 
         for image_path in chosen:
@@ -110,8 +119,7 @@ def build_bank(args) -> DefectExemplarBank:
 
     print("\n========== PatchCore ROI defect bank built ==========")
     print(f"classes: {bank.classes}")
-    print(f"num classes: {len(bank.classes)}")
-    print(f"shots/class: {args.shots}")
+    print(f"samples/class: {class_counts}")
     print(f"num exemplars: {len(bank.labels)}")
     print(f"embedding shape: {bank.embeddings.shape}")
     print(f"bank dir: {bank_dir.resolve()}")
