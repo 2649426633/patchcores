@@ -21,7 +21,6 @@ from app.anomaly.tiled import (
     crop_square_with_margin,
     inspect_tiled_patchcore,
     load_inspection_config,
-    save_regions_overlay,
     save_tiled_heatmap_overlay,
 )
 from app.defect.defect_bank import DefectExemplarBank
@@ -184,6 +183,7 @@ def main():
     print(f"defect bank:      {bank_dir}")
     print(f"known classes:    {cls_bank.classes}")
     print(f"output dir:       {output_dir}")
+    print("marked output:    FINAL RESULT ONLY")
     print("================================================")
 
     for index, image_path in enumerate(images, start=1):
@@ -203,7 +203,6 @@ def main():
 
             original = Image.open(image_path).convert("RGB")
             region_results = []
-            labels_for_overlay = []
             for region_index, region in enumerate(regions, start=1):
                 roi = crop_square_with_margin(
                     original,
@@ -219,9 +218,6 @@ def main():
                 )
                 result = {**region, **cls, "region_index": region_index}
                 region_results.append(result)
-                labels_for_overlay.append(
-                    f"R{region_index} {cls['predicted_class']} s={cls['top1_similarity']:.2f}"
-                )
                 roi.save(roi_dir / f"{image_path.stem}_R{region_index}_roi.png")
 
             primary = region_results[0]
@@ -231,14 +227,7 @@ def main():
             margin = primary["margin"]
             primary_bbox = primary["bbox"]
 
-            marked_path = marked_dir / f"{image_path.stem}_marked.jpg"
             heatmap_path = full_heatmap_dir / f"{image_path.stem}_heatmap.jpg"
-            save_regions_overlay(
-                image_path,
-                regions,
-                marked_path,
-                labels=labels_for_overlay,
-            )
             save_tiled_heatmap_overlay(
                 image_path,
                 tiled["tile_results"],
@@ -283,31 +272,35 @@ def main():
                 ensure_ascii=False,
             )
 
-            marked_path = marked_dir / f"{image_path.stem}_marked.jpg"
             roi_result["roi"].save(roi_dir / f"{image_path.stem}_R1_roi.png")
-            save_anomaly_map(
-                roi_result["anomaly_map"],
-                anomaly_dir / f"{image_path.stem}_anomaly.png",
-            )
-            pipeline.save_full_image_overlay(
-                image_path=image_path,
-                bbox=primary_bbox,
-                output_path=marked_path,
-                label=predicted,
-                anomaly_score=anomaly_score,
-                similarity=top1_similarity,
-            )
             anomaly_path = anomaly_dir / f"{image_path.stem}_anomaly.png"
+            save_anomaly_map(roi_result["anomaly_map"], anomaly_path)
 
         if args.anomaly_threshold is None:
             decision = "UNCALIBRATED"
-            final_result = f"KNOWN_DEFECT_CANDIDATE: {predicted}"
+            final_result = predicted
+            mark_label = predicted
         elif anomaly_score < args.anomaly_threshold:
             decision = "PASS"
             final_result = "PASS"
+            mark_label = "PASS"
         else:
             decision = "NG"
             final_result = f"NG: {predicted}"
+            mark_label = f"NG {predicted}"
+
+        # marked/ is intentionally the clean final deliverable:
+        # one primary bbox + one final result only. All intermediate candidates
+        # remain available in all_regions, rois/, and full_heatmaps/ for debugging.
+        marked_path = marked_dir / f"{image_path.stem}_marked.jpg"
+        pipeline.save_full_image_overlay(
+            image_path=image_path,
+            bbox=primary_bbox,
+            output_path=marked_path,
+            label=mark_label,
+            anomaly_score=anomaly_score,
+            similarity=top1_similarity,
+        )
 
         row = {
             "image": image_path.name,
@@ -334,7 +327,7 @@ def main():
         print(
             f"[{index:02d}/{len(images):02d}] {image_path.name} | "
             f"PatchCore={anomaly_score:.4f} | regions={num_regions} | "
-            f"primary={primary_bbox} | class={predicted} | "
+            f"FINAL bbox={primary_bbox} | FINAL class={final_result} | "
             f"sim={top1_similarity:.4f} | margin={margin:.4f}"
         )
 
@@ -353,10 +346,10 @@ def main():
     print("\nBatch inspection finished.")
     print(f"CSV:             {csv_path.resolve()}")
     print(f"JSON:            {json_path.resolve()}")
-    print(f"Marked images:   {marked_dir.resolve()}")
-    print(f"Region ROIs:     {roi_dir.resolve()}")
+    print(f"Final marked:    {marked_dir.resolve()}")
+    print(f"Region ROIs:     {roi_dir.resolve()}  (debug)")
     if inspection_mode == "tiled":
-        print(f"Full heatmaps:   {full_heatmap_dir.resolve()}")
+        print(f"Full heatmaps:   {full_heatmap_dir.resolve()}  (debug)")
 
 
 if __name__ == "__main__":
