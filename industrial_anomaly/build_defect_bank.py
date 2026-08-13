@@ -35,13 +35,22 @@ def parse_args():
             "No classifier training or DINOv2 fine-tuning is performed."
         )
     )
-    p.add_argument("--product", required=True, help="Product/SKU name, e.g. bottle")
+    p.add_argument("--product", required=True, help="Product/SKU name, e.g. phone")
     p.add_argument(
         "--defects-dir",
         default=None,
         help=(
-            "Override defect-class folder. Relative paths are resolved from "
+            "Folder containing defect-class subfolders. Relative paths are resolved from "
             "industrial_anomaly/. Default: products/<product>/defects"
+        ),
+    )
+    p.add_argument(
+        "--classes",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional explicit class-folder names, e.g. --classes shao1 shao2 shao3. "
+            "Use this when defects-dir also contains good/test folders."
         ),
     )
     p.add_argument(
@@ -80,6 +89,43 @@ def image_files(folder: Path) -> list[Path]:
     )
 
 
+def select_class_dirs(defects_dir: Path, requested: list[str] | None) -> list[Path]:
+    if requested:
+        seen = set()
+        names = []
+        for name in requested:
+            key = name.lower()
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
+
+        class_dirs = []
+        missing = []
+        for name in names:
+            folder = defects_dir / name
+            if not folder.is_dir():
+                missing.append(name)
+            else:
+                class_dirs.append(folder)
+        if missing:
+            raise FileNotFoundError(
+                f"Requested defect class folders not found under {defects_dir}: {missing}"
+            )
+        return class_dirs
+
+    ignored = {"good", "test", "train", "normal"}
+    return sorted(
+        [
+            d
+            for d in defects_dir.iterdir()
+            if d.is_dir()
+            and d.name.lower() not in ignored
+            and not d.name.startswith("_")
+        ],
+        key=lambda p: p.name.lower(),
+    )
+
+
 def main():
     args = parse_args()
     if args.shots < 0:
@@ -110,18 +156,11 @@ def main():
             "Run train_patchcore.py first."
         )
 
-    class_dirs = sorted(
-        [
-            d
-            for d in defects_dir.iterdir()
-            if d.is_dir() and d.name.lower() != "good" and not d.name.startswith("_")
-        ],
-        key=lambda p: p.name.lower(),
-    )
+    class_dirs = select_class_dirs(defects_dir, args.classes)
     if not class_dirs:
         raise RuntimeError(
             f"No defect class directories found in {defects_dir.resolve()}\n"
-            "Expected: defects/<class_name>/*.png"
+            "Use --classes <class1> <class2> ... when the dataset root also contains good/test."
         )
 
     pipeline = PatchCoreDINOv2Pipeline(
@@ -145,6 +184,7 @@ def main():
     print(f"repo root:       {REPO_ROOT}")
     print(f"product:         {args.product}")
     print(f"defects dir:     {defects_dir.resolve()}")
+    print(f"classes:         {[d.name for d in class_dirs]}")
     print(f"PatchCore:       {patchcore_model_dir.resolve()}")
     print(f"bank dir:        {bank_dir.resolve()}")
     print(f"shots/class:     {'ALL' if args.shots == 0 else args.shots}")
@@ -182,11 +222,13 @@ def main():
             overlay_path = bank_dir / "support_overlays" / class_dir.name / image_path.name
             roi_path.parent.mkdir(parents=True, exist_ok=True)
             roi_result["roi"].save(roi_path)
-            pipeline.save_bbox_overlay(roi_result["display_image"], roi_result["bbox"], overlay_path)
+            pipeline.save_bbox_overlay(
+                roi_result["display_image"], roi_result["bbox"], overlay_path
+            )
 
             print(
                 f"  + {image_path.name} score={roi_result['anomaly_score']:.3f} "
-                f"bbox={roi_result['bbox']}"
+                f"bbox={roi_result['bbox']} original_bbox={roi_result['original_bbox']}"
             )
 
     cls_bank = DefectExemplarBank(np.stack(cls_embeddings), labels, source_paths)
@@ -196,7 +238,7 @@ def main():
 
     bank_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "product": args.product,
         "classes": cls_bank.classes,
         "class_counts": class_counts,
