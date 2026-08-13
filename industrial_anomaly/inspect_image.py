@@ -35,11 +35,9 @@ def parse_args():
     )
     p.add_argument(
         "image",
-        help=(
-            "Input image path. Relative paths are resolved from industrial_anomaly/."
-        ),
+        help="Input image path. Relative paths are resolved from industrial_anomaly/.",
     )
-    p.add_argument("--product", required=True, help="Product/SKU name, e.g. bottle")
+    p.add_argument("--product", required=True, help="Product/SKU name, e.g. phone")
     p.add_argument(
         "--patchcore-model-dir",
         default=None,
@@ -179,12 +177,23 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
     roi_path = output_dir / "roi.png"
-    bbox_path = output_dir / "bbox.jpg"
+    bbox_path = output_dir / "bbox_crop.jpg"
+    full_marked_path = output_dir / "full_marked.jpg"
     anomaly_path = output_dir / "anomaly_map.png"
     result_path = output_dir / "result.json"
 
     roi_result["roi"].save(roi_path)
-    pipeline.save_bbox_overlay(roi_result["display_image"], roi_result["bbox"], bbox_path)
+    pipeline.save_bbox_overlay(
+        roi_result["display_image"], roi_result["bbox"], bbox_path
+    )
+    pipeline.save_full_image_overlay(
+        image_path=image_path,
+        bbox=roi_result["original_bbox"],
+        output_path=full_marked_path,
+        label=fused["predicted_class"],
+        anomaly_score=roi_result["anomaly_score"],
+        similarity=fused["top1_similarity"],
+    )
     save_anomaly_map(roi_result["anomaly_map"], anomaly_path)
 
     payload = {
@@ -193,7 +202,8 @@ def main():
         "patchcore_anomaly_score": float(roi_result["anomaly_score"]),
         "anomaly_threshold": args.anomaly_threshold,
         "anomaly_decision": anomaly_decision,
-        "bbox": list(roi_result["bbox"]),
+        "bbox_patchcore_crop": list(roi_result["bbox"]),
+        "bbox_original_image": list(roi_result["original_bbox"]),
         "bbox_source": roi_result["bbox_source"],
         "predicted_known_defect": fused["predicted_class"],
         "top1_similarity": fused["top1_similarity"],
@@ -202,6 +212,7 @@ def main():
         "margin": fused["margin"],
         "cls_nearest_exemplar": cls_result["nearest_exemplar"],
         "center_nearest_exemplar": center_result["nearest_exemplar"],
+        "full_marked_image": str(full_marked_path.resolve()),
         "final_result": final_result,
         "note": (
             "PASS/NG is only valid when --anomaly-threshold is supplied from a separate "
@@ -224,16 +235,16 @@ def main():
     else:
         print(f"PASS/NG threshold:    {args.anomaly_threshold:.6f}")
         print(f"anomaly decision:     {anomaly_decision}")
-    print(f"bbox:                 {roi_result['bbox']}")
+    print(f"bbox crop:            {roi_result['bbox']}")
+    print(f"bbox original:        {roi_result['original_bbox']}")
     print(f"bbox source:          {roi_result['bbox_source']}")
     print(f"known defect:         {fused['predicted_class']}")
     print(f"Top-1 similarity:     {fused['top1_similarity']:.6f}")
     print(f"Top-2 class:          {fused['top2_class']}")
     print(f"margin:               {fused['margin']:.6f}")
     print(f"final:                {final_result}")
-    print(f"output dir:           {output_dir.resolve()}")
+    print(f"Full marked image:    {full_marked_path.resolve()}")
     print(f"ROI:                  {roi_path.resolve()}")
-    print(f"BBox:                 {bbox_path.resolve()}")
     print(f"Anomaly map:          {anomaly_path.resolve()}")
     print(f"JSON:                 {result_path.resolve()}")
     print("===================================================")
