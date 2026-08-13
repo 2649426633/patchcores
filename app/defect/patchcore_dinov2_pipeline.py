@@ -9,7 +9,7 @@ from PIL import Image
 
 from app.anomaly.patchcore_adapter import PatchCoreAdapter
 from app.anomaly.postprocessing import extract_bbox_from_map, normalize_anomaly_map
-from app.anomaly.preprocessing import load_display_image
+from app.anomaly.preprocessing import load_display_image, map_display_bbox_to_original
 from app.defect.defect_bank import DefectExemplarBank
 from app.defect.dinov2_adapter import DINOv2Adapter
 
@@ -19,8 +19,7 @@ class PatchCoreDINOv2Pipeline:
 
     PatchCore answers where the anomaly is. The predicted anomaly ROI is then
     cropped from the same preprocessed image coordinate system and passed to a
-    frozen DINOv2 backbone. The aligned ``anomaly_roi`` can additionally guide
-    DINOv2 patch-token pooling without using any ground-truth mask.
+    frozen DINOv2 backbone.
     """
 
     def __init__(
@@ -60,9 +59,7 @@ class PatchCoreDINOv2Pipeline:
     @staticmethod
     def _border_fill(image: Image.Image) -> tuple[int, int, int]:
         arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
-        border = np.concatenate(
-            [arr[0], arr[-1], arr[:, 0], arr[:, -1]], axis=0
-        )
+        border = np.concatenate([arr[0], arr[-1], arr[:, 0], arr[:, -1]], axis=0)
         median = np.median(border.astype(np.float32), axis=0)
         return tuple(int(v) for v in median)
 
@@ -156,12 +153,6 @@ class PatchCoreDINOv2Pipeline:
         map_image: np.ndarray,
         crop_bbox: tuple[int, int, int, int],
     ) -> np.ndarray:
-        """Crop a 2-D map using the exact ROI canvas coordinates.
-
-        Regions outside the image are padded with zeros, matching the RGB ROI's
-        padding geometry. This keeps PatchCore anomaly weights spatially aligned
-        with the DINOv2 ROI.
-        """
         x1, y1, x2, y2 = crop_bbox
         side_w = max(1, x2 - x1)
         side_h = max(1, y2 - y1)
@@ -217,6 +208,13 @@ class PatchCoreDINOv2Pipeline:
             )
             bbox_source = "patchcore_component"
 
+        original_bbox = map_display_bbox_to_original(
+            image_path,
+            image_bbox,
+            resize=self.patchcore.config.resize,
+            imagesize=self.patchcore.config.imagesize,
+        )
+
         roi, expanded_bbox = self._crop_square_with_margin(display_image, image_bbox)
 
         display_norm = normalize_anomaly_map(anomaly_map)
@@ -235,6 +233,7 @@ class PatchCoreDINOv2Pipeline:
             "anomaly_map": anomaly_map,
             "anomaly_roi": anomaly_roi,
             "bbox": tuple(int(v) for v in image_bbox),
+            "original_bbox": tuple(int(v) for v in original_bbox),
             "expanded_bbox": tuple(int(v) for v in expanded_bbox),
             "bbox_source": bbox_source,
             "display_image": display_image,
@@ -252,29 +251,21 @@ class PatchCoreDINOv2Pipeline:
             raise RuntimeError("Pipeline is not loaded. Call load() first.")
         return self.dinov2.embed(
             roi,
-            feature_mode=(
-                self.dinov2_feature_mode if feature_mode is None else feature_mode
-            ),
-            center_fraction=(
-                self.center_fraction if center_fraction is None else center_fraction
-            ),
+            feature_mode=(self.dinov2_feature_mode if feature_mode is None else feature_mode),
+            center_fraction=(self.center_fraction if center_fraction is None else center_fraction),
             spatial_weights=spatial_weights,
         )
 
     def classify(self, image_path: str | Path) -> dict:
         if self.bank is None:
-            raise RuntimeError(
-                "No defect bank loaded. Pass bank_dir when creating the pipeline."
-            )
+            raise RuntimeError("No defect bank loaded. Pass bank_dir when creating the pipeline.")
 
         roi_result = self.extract_roi(image_path)
         mode = self.dinov2_feature_mode
         embedding = self.embed_roi(
             roi_result["roi"],
             feature_mode=mode,
-            spatial_weights=(
-                roi_result["anomaly_roi"] if mode == "patch_weighted" else None
-            ),
+            spatial_weights=(roi_result["anomaly_roi"] if mode == "patch_weighted" else None),
         )
         classification = self.bank.predict_embedding(embedding)
         return {**roi_result, **classification, "embedding": embedding}
@@ -293,4 +284,70 @@ class PatchCoreDINOv2Pipeline:
         x1, y1, x2, y2 = bbox
         cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 2)
         cv2.imwrite(str(output_path), canvas)
+        return output_path
+
+    @staticmethod
+    def save_full_image_overlay(
+        image_path: str | Path,
+        bbox: tuple[int, int, int, int],
+        output_path: str | Path,
+        label: Optional[str] = None,
+        anomaly_score: Optional[float] = None,
+        similarity: Optional[float] = None,
+    ) -> Path:
+        """Save the ORIGINAL full-resolution image with anomaly bbox and result text."""
+        image_path = Path(image_path)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        rgb = np.asarray(Image.open(image_path).convert("RGB"), dtype=np.uint8)
+        canvas = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        h, w = canvas.shape[:2]
+
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        x1 = max(0, min(w - 1, x1))
+        y1 = max(0, min(h - 1, y1))
+        x2 = max(x1 + 1, min(w - 1, x2))
+        y2 = max(y1 + 1, min(h - 1, y2))
+
+        thickness = max(2, int(round(min(w, h) / 350.0)))
+        font_scale = max(0.5, min(1.2, min(w, h) / 700.0))
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (0, 0, 255), thickness)
+
+        parts = []
+        if label:
+            parts.append(str(label))
+        if anomaly_score is not None:
+            parts.append(f"PatchCore={float(anomaly_score):.3f}")
+        if similarity is not None:
+            parts.append(f"sim={float(similarity):.3f}")
+        text = " | ".join(parts)
+
+        if text:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            text_thickness = max(1, thickness - 1)
+            (tw, th), baseline = cv2.getTextSize(text, font, font_scale, text_thickness)
+            tx = max(0, min(w - tw - 2, x1))
+            ty = y1 - 8
+            if ty - th - baseline < 0:
+                ty = min(h - baseline - 2, y2 + th + baseline + 8)
+            bg_y1 = max(0, ty - th - baseline - 4)
+            bg_y2 = min(h - 1, ty + baseline + 3)
+            cv2.rectangle(canvas, (tx, bg_y1), (min(w - 1, tx + tw + 6), bg_y2), (0, 0, 0), -1)
+            cv2.putText(
+                canvas,
+                text,
+                (tx + 3, ty),
+                font,
+                font_scale,
+                (255, 255, 255),
+                text_thickness,
+                cv2.LINE_AA,
+            )
+
+        ext = output_path.suffix.lower() or ".jpg"
+        ok, encoded = cv2.imencode(ext, canvas)
+        if not ok:
+            raise RuntimeError(f"Failed to encode marked image: {output_path}")
+        encoded.tofile(str(output_path))
         return output_path
