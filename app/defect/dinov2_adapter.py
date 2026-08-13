@@ -14,7 +14,7 @@ from torchvision import transforms
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
-FEATURE_MODES = ("cls", "patch_mean", "patch_center")
+FEATURE_MODES = ("cls", "patch_mean", "patch_center", "patch_weighted")
 
 
 @dataclass
@@ -30,10 +30,10 @@ class DINOv2Config:
 class DINOv2Adapter:
     """Frozen DINOv2 feature extractor for few-shot defect recognition.
 
-    The engineering default remains the DINOv2 ViT-S/14 CLS token. For local
-    industrial defects, ``patch_mean`` and ``patch_center`` expose alternative
-    embeddings derived from DINOv2's normalized patch tokens without changing
-    or fine-tuning the backbone.
+    Besides the default CLS feature, the adapter exposes global patch mean,
+    center-patch mean, and externally guided weighted patch pooling. The
+    ``patch_weighted`` mode is intended for PatchCore anomaly-map guidance and
+    does not modify or fine-tune DINOv2.
     """
 
     def __init__(
@@ -131,42 +131,82 @@ class DINOv2Adapter:
         tensor = self._transform()(pil_image)
         return tensor.unsqueeze(0).to(self.device)
 
+    @staticmethod
+    def _patch_grid_size(patch_tokens: torch.Tensor) -> int:
+        if patch_tokens.ndim != 3 or patch_tokens.shape[0] != 1:
+            raise RuntimeError(
+                f"Unexpected patch-token shape: {tuple(patch_tokens.shape)}"
+            )
+        n_tokens = int(patch_tokens.shape[1])
+        grid = int(round(math.sqrt(n_tokens)))
+        if grid * grid != n_tokens:
+            raise RuntimeError(
+                f"Expected square patch-token grid, got {n_tokens} tokens"
+            )
+        return grid
+
     def _pool_patch_tokens(
         self,
         patch_tokens: torch.Tensor,
         feature_mode: str,
         center_fraction: float,
+        spatial_weights: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
-        if patch_tokens.ndim != 3 or patch_tokens.shape[0] != 1:
-            raise RuntimeError(
-                f"Unexpected patch-token shape: {tuple(patch_tokens.shape)}"
-            )
+        grid = self._patch_grid_size(patch_tokens)
 
         if feature_mode == "patch_mean":
             return patch_tokens.mean(dim=1)
 
-        if feature_mode != "patch_center":
-            raise ValueError(f"Unsupported patch feature mode: {feature_mode}")
+        if feature_mode == "patch_center":
+            fraction = float(center_fraction)
+            if not (0.0 < fraction <= 1.0):
+                raise ValueError("center_fraction must be in (0, 1]")
 
-        n_tokens = int(patch_tokens.shape[1])
-        grid = int(round(math.sqrt(n_tokens)))
-        if grid * grid != n_tokens:
-            raise RuntimeError(
-                "patch_center expects a square token grid, but got "
-                f"{n_tokens} patch tokens"
+            keep = max(1, min(grid, int(round(grid * fraction))))
+            start = (grid - keep) // 2
+            end = start + keep
+
+            grid_tokens = patch_tokens.reshape(
+                1, grid, grid, patch_tokens.shape[-1]
             )
+            center_tokens = grid_tokens[:, start:end, start:end, :]
+            return center_tokens.reshape(
+                1, -1, patch_tokens.shape[-1]
+            ).mean(dim=1)
 
-        fraction = float(center_fraction)
-        if not (0.0 < fraction <= 1.0):
-            raise ValueError("center_fraction must be in (0, 1]")
+        if feature_mode == "patch_weighted":
+            if spatial_weights is None:
+                raise ValueError(
+                    "patch_weighted requires a 2-D spatial_weights anomaly map"
+                )
+            weights = np.asarray(spatial_weights, dtype=np.float32)
+            if weights.ndim != 2:
+                raise ValueError(
+                    f"spatial_weights must be 2-D, got {weights.shape}"
+                )
+            if not np.isfinite(weights).all():
+                raise ValueError("spatial_weights contains non-finite values")
 
-        keep = max(1, min(grid, int(round(grid * fraction))))
-        start = (grid - keep) // 2
-        end = start + keep
+            weights = np.clip(weights, 0.0, None)
+            weight_tensor = torch.from_numpy(weights).to(
+                device=patch_tokens.device,
+                dtype=patch_tokens.dtype,
+            )[None, None, :, :]
+            weight_tensor = F.interpolate(
+                weight_tensor,
+                size=(grid, grid),
+                mode="bilinear",
+                align_corners=False,
+            )
+            weight_tensor = weight_tensor.reshape(1, grid * grid, 1)
+            weight_sum = weight_tensor.sum(dim=1, keepdim=True)
+            if float(weight_sum.item()) <= 1e-12:
+                return patch_tokens.mean(dim=1)
 
-        grid_tokens = patch_tokens.reshape(1, grid, grid, patch_tokens.shape[-1])
-        center_tokens = grid_tokens[:, start:end, start:end, :]
-        return center_tokens.reshape(1, -1, patch_tokens.shape[-1]).mean(dim=1)
+            normalized_weights = weight_tensor / weight_sum
+            return (patch_tokens * normalized_weights).sum(dim=1)
+
+        raise ValueError(f"Unsupported patch feature mode: {feature_mode}")
 
     @torch.inference_mode()
     def embed(
@@ -174,6 +214,7 @@ class DINOv2Adapter:
         image: str | Path | Image.Image,
         feature_mode: str = "cls",
         center_fraction: Optional[float] = None,
+        spatial_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if self.model is None:
             raise RuntimeError("DINOv2 is not loaded. Call load() first.")
@@ -199,6 +240,7 @@ class DINOv2Adapter:
                     if center_fraction is None
                     else float(center_fraction)
                 ),
+                spatial_weights=spatial_weights,
             )
 
         embedding = F.normalize(embedding, p=2, dim=-1)
