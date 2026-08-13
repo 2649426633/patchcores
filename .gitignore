@@ -1,49 +1,30 @@
-# PyCharm
-.idea/
-
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Virtual environments
+*.py[cod]
 .venv/
 venv/
 env/
 
-# Model / cache
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local datasets and generated product data
+/data/
+/industrial_anomaly/products/
+/industrial_anomaly/outputs/
+/products/
+/outputs/
+/checkpoints/
+
+# Model weights and generated indexes
 *.pth
 *.pt
 *.ckpt
-
-# Dataset
-products/*/normal/
-products/*/test/
-
-# Outputs
-outputs/
-
-# OS
-.DS_Store
-Thumbs.db
-# Local datasets
-/data/
-
-# IDE
-/.vscode/
-
-# Python cache
-__pycache__/
-*.pyc
-
-# Generated models
-outputs/
-checkpoints/
 *.faiss
 *.pkl
-*.pth
-*.pt
 
-# Local third-party source used only for offline DINOv2 loading
+# Local third-party DINOv2 source used for offline loading
 /third_party/dinov2/
