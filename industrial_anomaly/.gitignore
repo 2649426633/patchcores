@@ -1,0 +1,11 @@
+# Product data and generated artifacts
+products/*/train/
+products/*/defects/
+products/*/models/
+outputs/
+
+# Keep lightweight documentation/config files if added later
+!products/README.md
+
+__pycache__/
+*.pyc
