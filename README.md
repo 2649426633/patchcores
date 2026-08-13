@@ -1,103 +1,68 @@
-# PatchCore Industrial Anomaly Detection - Phase 1
+# Industrial Anomaly Detection
 
-This repository vendors the PatchCore core implementation and adds a small application layer for offline training and single-image inference.
+Clean production-oriented pipeline for:
 
-## Required local files
+1. **Unsupervised anomaly detection/localization** with PatchCore trained on normal images only.
+2. **Known defect classification** with frozen DINOv2 and a few-shot exemplar bank.
 
-Do **not** upload datasets, generated FAISS indexes, or model weights to GitHub.
+## Start here
 
-Place the WideResNet50-2 ImageNet weight at exactly:
-
-```text
-weights/wide_resnet50_2-95faca4d.pth
-```
-
-For MVTec AD screw, keep the dataset locally as:
+All day-to-day commands are in:
 
 ```text
-data/screw/
-├─ train/good/
-├─ test/
-└─ ground_truth/
+industrial_anomaly/
+├── train_patchcore.py
+├── build_defect_bank.py
+├── inspect_image.py
+└── README.md
 ```
 
-## Project structure
+The remaining repository folders are supporting core code:
 
 ```text
-patchcores/
-├─ app/
-│  └─ anomaly/
-│     ├─ image_dataset.py
-│     ├─ preprocessing.py
-│     ├─ patchcore_adapter.py
-│     └─ postprocessing.py
-├─ patchcore/                 # vendored PatchCore core
-├─ weights/
-│  └─ wide_resnet50_2-95faca4d.pth   # local only, ignored by git
-├─ data/                      # local only, ignored by git
-├─ products/                  # generated model files, ignored by git
-├─ outputs/                   # generated visualizations, ignored by git
-├─ train_patchcore.py
-├─ predict_patchcore.py
-└─ requirements_project.txt
+app/
+├── anomaly/   # PatchCore adapter, preprocessing, localization
+└── defect/    # DINOv2 adapter, exemplar bank, end-to-end ROI pipeline
+
+patchcore/             # vendored PatchCore core; keep unchanged
+weights/               # local weight instructions/placeholders
+third_party_licenses/  # third-party licenses
 ```
 
-## Environment
+## Typical workflow
 
-Install PyTorch and torchvision first using versions appropriate for your CPU/CUDA environment. Then install application dependencies:
+From the repository root:
 
 ```powershell
-python -m pip install -r requirements_project.txt
+cd industrial_anomaly
 ```
 
-On the current Windows environment, if FAISS and PyTorch trigger an OpenMP duplicate-runtime error during development, the temporary workaround used in this project session is:
+Train PatchCore from normal images only:
 
 ```powershell
-$env:KMP_DUPLICATE_LIB_OK="TRUE"
+python train_patchcore.py --product bottle --normal-dir ..\data\bottle\train\good
 ```
 
-Do not treat that environment variable as a final production deployment solution.
-
-## Train screw PatchCore
+Build a known-defect exemplar bank:
 
 ```powershell
-python train_patchcore.py
+python build_defect_bank.py --product bottle --defects-dir ..\data\bottle\test --shots 10
 ```
 
-Defaults:
-
-```text
-normal images: data/screw/train/good
-model output:  products/screw/models/patchcore
-```
-
-Successful training creates locally:
-
-```text
-products/screw/models/patchcore/
-├─ patchcore_params.pkl
-└─ nnscorer_search_index.faiss
-```
-
-## Predict one image
+Inspect one image:
 
 ```powershell
-python predict_patchcore.py "data/screw/test/scratch_head/000.png"
+python inspect_image.py ..\data\bottle\test\broken_large\000.png --product bottle
 ```
 
-Outputs include:
+See `industrial_anomaly/README.md` for the full folder layout and options.
 
-- image-level anomaly score
-- anomaly heatmap
-- heatmap overlay
-- candidate anomaly bounding box
+## Local dependencies
 
-The current phase deliberately does not assign PASS/NG because a product-specific anomaly threshold has not yet been calibrated.
+Install `torch` and `torchvision` separately so they match your CUDA environment, then:
 
-## Offline behavior
+```powershell
+pip install -r requirements.txt
+```
 
-`PatchCoreAdapter` does not use the upstream `load_from_path()` backbone reconstruction path. Both training and inference load WideResNet50-2 from the local file in `weights/`, so prediction does not need to download torchvision weights.
-
-## Third-party code
-
-The vendored PatchCore core originates from Amazon Science's `patchcore-inspection` repository and is distributed under Apache License 2.0. See `third_party_licenses/patchcore/`.
+Offline runtime also expects local model assets described in `weights/` and a local DINOv2 checkout at `third_party/dinov2/`.
