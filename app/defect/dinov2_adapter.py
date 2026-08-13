@@ -31,9 +31,9 @@ class DINOv2Adapter:
     """Frozen DINOv2 feature extractor for few-shot defect recognition.
 
     Besides the default CLS feature, the adapter exposes global patch mean,
-    center-patch mean, and externally guided weighted patch pooling. The
-    ``patch_weighted`` mode is intended for PatchCore anomaly-map guidance and
-    does not modify or fine-tune DINOv2.
+    center-patch mean, externally guided weighted patch pooling, and the raw
+    normalized patch-token grid for local exemplar matching. The official
+    DINOv2 backbone remains frozen and unchanged.
     """
 
     def __init__(
@@ -207,6 +207,22 @@ class DINOv2Adapter:
             return (patch_tokens * normalized_weights).sum(dim=1)
 
         raise ValueError(f"Unsupported patch feature mode: {feature_mode}")
+
+    @torch.inference_mode()
+    def patch_tokens(
+        self,
+        image: str | Path | Image.Image,
+    ) -> np.ndarray:
+        """Return L2-normalized DINOv2 patch tokens as [N, D]."""
+        if self.model is None:
+            raise RuntimeError("DINOv2 is not loaded. Call load() first.")
+
+        tensor = self._prepare_image(image)
+        features = self.model.forward_features(tensor)
+        tokens = features["x_norm_patchtokens"]
+        self._patch_grid_size(tokens)
+        tokens = F.normalize(tokens, p=2, dim=-1)
+        return tokens[0].detach().cpu().numpy().astype(np.float32)
 
     @torch.inference_mode()
     def embed(
