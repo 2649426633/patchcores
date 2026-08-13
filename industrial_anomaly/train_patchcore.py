@@ -14,6 +14,14 @@ from app.anomaly.image_dataset import create_normal_dataloader
 from app.anomaly.patchcore_adapter import PatchCoreAdapter, PatchCoreConfig
 
 
+def resolve_clean_path(value: str | Path) -> Path:
+    """Resolve CLI paths consistently relative to industrial_anomaly/."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = CLEAN_ROOT / path
+    return path.resolve()
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="Train one product's PatchCore model using NORMAL images only."
@@ -22,12 +30,18 @@ def parse_args():
     p.add_argument(
         "--normal-dir",
         default=None,
-        help="Override normal-image folder. Default: products/<product>/train/good",
+        help=(
+            "Override normal-image folder. Relative paths are resolved from "
+            "industrial_anomaly/. Default: products/<product>/train/good"
+        ),
     )
     p.add_argument(
         "--model-dir",
         default=None,
-        help="Override model folder. Default: products/<product>/models/patchcore",
+        help=(
+            "Override model folder. Relative paths are resolved from industrial_anomaly/. "
+            "Default: products/<product>/models/patchcore"
+        ),
     )
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--device", default=None, help="cpu, cuda or cuda:0")
@@ -46,8 +60,16 @@ def parse_args():
 def main():
     args = parse_args()
     product_dir = CLEAN_ROOT / "products" / args.product
-    normal_dir = Path(args.normal_dir) if args.normal_dir else product_dir / "train" / "good"
-    model_dir = Path(args.model_dir) if args.model_dir else product_dir / "models" / "patchcore"
+    normal_dir = (
+        resolve_clean_path(args.normal_dir)
+        if args.normal_dir
+        else product_dir / "train" / "good"
+    )
+    model_dir = (
+        resolve_clean_path(args.model_dir)
+        if args.model_dir
+        else product_dir / "models" / "patchcore"
+    )
 
     if not normal_dir.exists():
         raise FileNotFoundError(
@@ -84,13 +106,15 @@ def main():
     detector = PatchCoreAdapter(device=args.device, config=config)
 
     print("========== Clean PatchCore Training ==========")
-    print(f"product:       {args.product}")
-    print(f"normal dir:    {normal_dir.resolve()}")
-    print(f"normal images: {len(loader.dataset)}")
-    print(f"resize/crop:   {config.resize}/{config.imagesize}")
-    print(f"layers:        {config.layers}")
-    print(f"coreset:       {config.coreset_sampling_ratio}")
-    print(f"model dir:     {model_dir.resolve()}")
+    print(f"clean root:     {CLEAN_ROOT}")
+    print(f"repo root:      {REPO_ROOT}")
+    print(f"product:        {args.product}")
+    print(f"normal dir:     {normal_dir.resolve()}")
+    print(f"normal images:  {len(loader.dataset)}")
+    print(f"resize/crop:    {config.resize}/{config.imagesize}")
+    print(f"layers:         {config.layers}")
+    print(f"coreset:        {config.coreset_sampling_ratio}")
+    print(f"model dir:      {model_dir.resolve()}")
     print("NOTE: no defect labels/images are used in PatchCore training.")
     print("==============================================")
 
