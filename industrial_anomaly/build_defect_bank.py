@@ -20,6 +20,14 @@ from app.defect.patchcore_dinov2_pipeline import PatchCoreDINOv2Pipeline
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
+def resolve_clean_path(value: str | Path) -> Path:
+    """Resolve CLI paths consistently relative to industrial_anomaly/."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = CLEAN_ROOT / path
+    return path.resolve()
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
@@ -31,17 +39,26 @@ def parse_args():
     p.add_argument(
         "--defects-dir",
         default=None,
-        help="Override defect-class folder. Default: products/<product>/defects",
+        help=(
+            "Override defect-class folder. Relative paths are resolved from "
+            "industrial_anomaly/. Default: products/<product>/defects"
+        ),
     )
     p.add_argument(
         "--patchcore-model-dir",
         default=None,
-        help="Default: products/<product>/models/patchcore",
+        help=(
+            "Relative paths are resolved from industrial_anomaly/. "
+            "Default: products/<product>/models/patchcore"
+        ),
     )
     p.add_argument(
         "--bank-dir",
         default=None,
-        help="Default: products/<product>/models/defect_bank",
+        help=(
+            "Relative paths are resolved from industrial_anomaly/. "
+            "Default: products/<product>/models/defect_bank"
+        ),
     )
     p.add_argument(
         "--shots",
@@ -69,13 +86,21 @@ def main():
         raise ValueError("--shots must be >= 0")
 
     product_dir = CLEAN_ROOT / "products" / args.product
-    defects_dir = Path(args.defects_dir) if args.defects_dir else product_dir / "defects"
+    defects_dir = (
+        resolve_clean_path(args.defects_dir)
+        if args.defects_dir
+        else product_dir / "defects"
+    )
     patchcore_model_dir = (
-        Path(args.patchcore_model_dir)
+        resolve_clean_path(args.patchcore_model_dir)
         if args.patchcore_model_dir
         else product_dir / "models" / "patchcore"
     )
-    bank_dir = Path(args.bank_dir) if args.bank_dir else product_dir / "models" / "defect_bank"
+    bank_dir = (
+        resolve_clean_path(args.bank_dir)
+        if args.bank_dir
+        else product_dir / "models" / "defect_bank"
+    )
 
     if not defects_dir.exists():
         raise FileNotFoundError(f"Defect folder not found: {defects_dir.resolve()}")
@@ -116,11 +141,14 @@ def main():
     class_counts: dict[str, int] = {}
 
     print("========== Build Known Defect Bank ==========")
-    print(f"product:        {args.product}")
-    print(f"defects dir:    {defects_dir.resolve()}")
-    print(f"PatchCore:      {patchcore_model_dir.resolve()}")
-    print(f"shots/class:    {'ALL' if args.shots == 0 else args.shots}")
-    print("feature fusion: 50% DINOv2 CLS + 50% DINOv2 Patch Center")
+    print(f"clean root:      {CLEAN_ROOT}")
+    print(f"repo root:       {REPO_ROOT}")
+    print(f"product:         {args.product}")
+    print(f"defects dir:     {defects_dir.resolve()}")
+    print(f"PatchCore:       {patchcore_model_dir.resolve()}")
+    print(f"bank dir:        {bank_dir.resolve()}")
+    print(f"shots/class:     {'ALL' if args.shots == 0 else args.shots}")
+    print("feature fusion:  50% DINOv2 CLS + 50% DINOv2 Patch Center")
     print("=============================================")
 
     for class_dir in class_dirs:
