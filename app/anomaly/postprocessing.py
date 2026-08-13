@@ -32,7 +32,7 @@ def _prepare_regions(anomaly_map, relative_threshold=0.70):
     binary = (smooth >= relative_threshold).astype(np.uint8)
 
     # Close tiny gaps inside one hot region. Do not use MORPH_OPEN here because
-    # opening can remove narrow scratches or thin thread defects.
+    # opening can remove narrow scratches or other thin defects.
     kernel = np.ones((3, 3), dtype=np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
@@ -58,13 +58,7 @@ def _distance_point_to_component(labels, label, px, py):
 
 
 def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
-    """Return valid connected anomaly regions ranked by anomaly evidence.
-
-    This remains the fallback strategy. Normal localization now first tries the
-    component nearest the global PatchCore anomaly peak, because evaluation on
-    MVTec screw showed cases where the peak was inside the real defect but an
-    evidence-ranked component elsewhere was selected as the final bbox.
-    """
+    """Return connected anomaly regions ranked by anomaly evidence."""
     norm, smooth, _, num_labels, labels, stats = _prepare_regions(
         anomaly_map,
         relative_threshold=relative_threshold,
@@ -98,14 +92,14 @@ def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
 
         candidates.append(
             {
-                "label": label,
+                "label": int(label),
                 "bbox": (x1, y1, x2, y2),
                 "area": area,
                 "peak": peak,
                 "q90": q90,
                 "mean": mean,
-                "touches_border": touches_border,
-                "evidence": evidence,
+                "touches_border": bool(touches_border),
+                "evidence": float(evidence),
             }
         )
 
@@ -116,23 +110,40 @@ def _candidate_regions(anomaly_map, relative_threshold=0.70, min_area=10):
     return candidates
 
 
+def extract_regions_from_map(
+    anomaly_map,
+    relative_threshold=0.70,
+    min_area=10,
+    max_regions=None,
+):
+    """Return all meaningful PatchCore hot regions instead of forcing one bbox.
+
+    Each returned item contains ``bbox``, ``evidence``, ``peak``, ``area`` and
+    ``touches_border``.  This is intended for industrial images where one defect
+    can fragment into several connected components or several anomalies can be
+    present in the same image.
+    """
+    regions = _candidate_regions(
+        anomaly_map,
+        relative_threshold=relative_threshold,
+        min_area=min_area,
+    )
+    if max_regions is not None:
+        regions = regions[: max(0, int(max_regions))]
+    return regions
+
+
 def extract_bbox_from_map(
     anomaly_map,
     relative_threshold=0.70,
     min_area=10,
     peak_max_distance=8.0,
 ):
-    """Extract a defect bbox using the global anomaly peak as the primary anchor.
+    """Extract one primary bbox using the global anomaly peak as the anchor.
 
-    Strategy:
-    1. Find the global maximum in the original normalized PatchCore anomaly map.
-    2. Threshold a lightly smoothed map and build connected components.
-    3. Prefer the valid component containing, or nearest to, that global peak.
-    4. Fall back to anomaly-evidence ranking only when no valid component is near
-       the peak.
-
-    ``relative_threshold`` is for localization visualization only. It is not the
-    final image-level PASS/NG threshold.
+    This legacy single-region API is kept for existing pipelines.  New full-image
+    industrial inspection should prefer ``extract_regions_from_map`` so valid
+    secondary regions are not silently discarded.
     """
     norm, _, _, num_labels, labels, stats = _prepare_regions(
         anomaly_map,
@@ -158,9 +169,6 @@ def extract_bbox_from_map(
             nearest_distance = distance
             nearest = label
 
-    # A small tolerance handles sub-pixel/blur shifts between the original map
-    # peak and the thresholded smoothed component without letting distant hot
-    # regions steal the bbox.
     if nearest is not None and nearest_distance <= peak_max_distance:
         return _component_bbox(stats, nearest)
 
