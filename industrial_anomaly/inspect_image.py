@@ -19,28 +19,50 @@ from app.defect.defect_bank import DefectExemplarBank
 from app.defect.patchcore_dinov2_pipeline import PatchCoreDINOv2Pipeline
 
 
+def resolve_clean_path(value: str | Path) -> Path:
+    """Resolve CLI paths consistently relative to industrial_anomaly/."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = CLEAN_ROOT / path
+    return path.resolve()
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description=(
             "Inspect one image: PatchCore anomaly localization -> DINOv2 known-defect classification."
         )
     )
-    p.add_argument("image", help="Input image path")
+    p.add_argument(
+        "image",
+        help=(
+            "Input image path. Relative paths are resolved from industrial_anomaly/."
+        ),
+    )
     p.add_argument("--product", required=True, help="Product/SKU name, e.g. bottle")
     p.add_argument(
         "--patchcore-model-dir",
         default=None,
-        help="Default: products/<product>/models/patchcore",
+        help=(
+            "Relative paths are resolved from industrial_anomaly/. "
+            "Default: products/<product>/models/patchcore"
+        ),
     )
     p.add_argument(
         "--bank-dir",
         default=None,
-        help="Default: products/<product>/models/defect_bank",
+        help=(
+            "Relative paths are resolved from industrial_anomaly/. "
+            "Default: products/<product>/models/defect_bank"
+        ),
     )
     p.add_argument(
         "--output-dir",
         default=None,
-        help="Default: outputs/<product>/<image_stem>",
+        help=(
+            "Relative paths are resolved from industrial_anomaly/. "
+            "Default: outputs/<product>/<image_stem>"
+        ),
     )
     p.add_argument("--device", default=None, help="cpu, cuda or cuda:0")
     p.add_argument("--bbox-relative-threshold", type=float, default=0.80)
@@ -84,19 +106,23 @@ def save_anomaly_map(anomaly_map: np.ndarray, output_path: Path) -> None:
 
 def main():
     args = parse_args()
-    image_path = Path(args.image)
+    image_path = resolve_clean_path(args.image)
     if not image_path.exists():
-        raise FileNotFoundError(image_path)
+        raise FileNotFoundError(f"Input image not found: {image_path}")
 
     product_dir = CLEAN_ROOT / "products" / args.product
     patchcore_model_dir = (
-        Path(args.patchcore_model_dir)
+        resolve_clean_path(args.patchcore_model_dir)
         if args.patchcore_model_dir
         else product_dir / "models" / "patchcore"
     )
-    bank_dir = Path(args.bank_dir) if args.bank_dir else product_dir / "models" / "defect_bank"
+    bank_dir = (
+        resolve_clean_path(args.bank_dir)
+        if args.bank_dir
+        else product_dir / "models" / "defect_bank"
+    )
     output_dir = (
-        Path(args.output_dir)
+        resolve_clean_path(args.output_dir)
         if args.output_dir
         else CLEAN_ROOT / "outputs" / args.product / image_path.stem
     )
@@ -186,8 +212,12 @@ def main():
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print("========== Industrial Anomaly Inspection ==========")
+    print(f"clean root:           {CLEAN_ROOT}")
+    print(f"repo root:            {REPO_ROOT}")
     print(f"product:              {args.product}")
     print(f"image:                {image_path.resolve()}")
+    print(f"PatchCore model:      {patchcore_model_dir.resolve()}")
+    print(f"defect bank:          {bank_dir.resolve()}")
     print(f"PatchCore score:      {roi_result['anomaly_score']:.6f}")
     if args.anomaly_threshold is None:
         print("PASS/NG threshold:    NOT SET (score only)")
@@ -201,6 +231,7 @@ def main():
     print(f"Top-2 class:          {fused['top2_class']}")
     print(f"margin:               {fused['margin']:.6f}")
     print(f"final:                {final_result}")
+    print(f"output dir:           {output_dir.resolve()}")
     print(f"ROI:                  {roi_path.resolve()}")
     print(f"BBox:                 {bbox_path.resolve()}")
     print(f"Anomaly map:          {anomaly_path.resolve()}")
