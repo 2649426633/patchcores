@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 
 CLEAN_ROOT = Path(__file__).resolve().parent
@@ -13,6 +14,12 @@ REPO_ROOT = CLEAN_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from app.anomaly.tiled import (
+    crop_square_with_margin,
+    inspect_tiled_patchcore,
+    load_inspection_config,
+    save_regions_overlay,
+)
 from app.defect.defect_bank import DefectExemplarBank
 from app.defect.patchcore_dinov2_pipeline import PatchCoreDINOv2Pipeline
 
@@ -21,7 +28,6 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def resolve_clean_path(value: str | Path) -> Path:
-    """Resolve CLI paths consistently relative to industrial_anomaly/."""
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = CLEAN_ROOT / path
@@ -30,53 +36,21 @@ def resolve_clean_path(value: str | Path) -> Path:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description=(
-            "Build a KNOWN defect exemplar bank from PatchCore-located ROIs. "
-            "No classifier training or DINOv2 fine-tuning is performed."
-        )
+        description="Build a known-defect exemplar bank from PatchCore-located ROIs."
     )
     p.add_argument("--product", required=True, help="Product/SKU name, e.g. phone")
-    p.add_argument(
-        "--defects-dir",
-        default=None,
-        help=(
-            "Folder containing defect-class subfolders. Relative paths are resolved from "
-            "industrial_anomaly/. Default: products/<product>/defects"
-        ),
-    )
+    p.add_argument("--defects-dir", default=None)
     p.add_argument(
         "--classes",
         nargs="+",
         default=None,
-        help=(
-            "Optional explicit class-folder names, e.g. --classes shao1 shao2 shao3. "
-            "Use this when defects-dir also contains good/test folders."
-        ),
+        help="Explicit class folders, e.g. --classes shao1 shao2 shao3",
     )
-    p.add_argument(
-        "--patchcore-model-dir",
-        default=None,
-        help=(
-            "Relative paths are resolved from industrial_anomaly/. "
-            "Default: products/<product>/models/patchcore"
-        ),
-    )
-    p.add_argument(
-        "--bank-dir",
-        default=None,
-        help=(
-            "Relative paths are resolved from industrial_anomaly/. "
-            "Default: products/<product>/models/defect_bank"
-        ),
-    )
-    p.add_argument(
-        "--shots",
-        type=int,
-        default=10,
-        help="Samples/class. Use 0 for all available images.",
-    )
+    p.add_argument("--patchcore-model-dir", default=None)
+    p.add_argument("--bank-dir", default=None)
+    p.add_argument("--shots", type=int, default=10)
     p.add_argument("--device", default=None, help="cpu, cuda or cuda:0")
-    p.add_argument("--bbox-relative-threshold", type=float, default=0.80)
+    p.add_argument("--bbox-relative-threshold", type=float, default=0.78)
     p.add_argument("--roi-margin", type=float, default=0.50)
     p.add_argument("--center-fraction", type=float, default=0.50)
     return p.parse_args()
@@ -91,22 +65,18 @@ def image_files(folder: Path) -> list[Path]:
 
 def select_class_dirs(defects_dir: Path, requested: list[str] | None) -> list[Path]:
     if requested:
+        class_dirs, missing = [], []
         seen = set()
-        names = []
         for name in requested:
             key = name.lower()
-            if key not in seen:
-                seen.add(key)
-                names.append(name)
-
-        class_dirs = []
-        missing = []
-        for name in names:
+            if key in seen:
+                continue
+            seen.add(key)
             folder = defects_dir / name
-            if not folder.is_dir():
-                missing.append(name)
-            else:
+            if folder.is_dir():
                 class_dirs.append(folder)
+            else:
+                missing.append(name)
         if missing:
             raise FileNotFoundError(
                 f"Requested defect class folders not found under {defects_dir}: {missing}"
@@ -132,36 +102,29 @@ def main():
         raise ValueError("--shots must be >= 0")
 
     product_dir = CLEAN_ROOT / "products" / args.product
-    defects_dir = (
-        resolve_clean_path(args.defects_dir)
-        if args.defects_dir
-        else product_dir / "defects"
-    )
+    defects_dir = resolve_clean_path(args.defects_dir) if args.defects_dir else product_dir / "defects"
     patchcore_model_dir = (
         resolve_clean_path(args.patchcore_model_dir)
         if args.patchcore_model_dir
         else product_dir / "models" / "patchcore"
     )
-    bank_dir = (
-        resolve_clean_path(args.bank_dir)
-        if args.bank_dir
-        else product_dir / "models" / "defect_bank"
-    )
+    bank_dir = resolve_clean_path(args.bank_dir) if args.bank_dir else product_dir / "models" / "defect_bank"
 
-    if not defects_dir.exists():
-        raise FileNotFoundError(f"Defect folder not found: {defects_dir.resolve()}")
+    if not defects_dir.is_dir():
+        raise FileNotFoundError(f"Defect folder not found: {defects_dir}")
     if not patchcore_model_dir.exists():
         raise FileNotFoundError(
-            f"PatchCore model not found: {patchcore_model_dir.resolve()}\n"
-            "Run train_patchcore.py first."
+            f"PatchCore model not found: {patchcore_model_dir}\nRun train_patchcore.py first."
         )
 
     class_dirs = select_class_dirs(defects_dir, args.classes)
     if not class_dirs:
-        raise RuntimeError(
-            f"No defect class directories found in {defects_dir.resolve()}\n"
-            "Use --classes <class1> <class2> ... when the dataset root also contains good/test."
-        )
+        raise RuntimeError("No defect class directories found.")
+
+    inspection_cfg = load_inspection_config(patchcore_model_dir)
+    inspection_mode = inspection_cfg.get("mode", "center_crop")
+    tile_fraction = float(inspection_cfg.get("tile_fraction", 0.75))
+    tile_overlap = float(inspection_cfg.get("tile_overlap", 0.25))
 
     pipeline = PatchCoreDINOv2Pipeline(
         patchcore_model_dir=patchcore_model_dir,
@@ -180,15 +143,16 @@ def main():
     class_counts: dict[str, int] = {}
 
     print("========== Build Known Defect Bank ==========")
-    print(f"clean root:      {CLEAN_ROOT}")
-    print(f"repo root:       {REPO_ROOT}")
-    print(f"product:         {args.product}")
-    print(f"defects dir:     {defects_dir.resolve()}")
-    print(f"classes:         {[d.name for d in class_dirs]}")
-    print(f"PatchCore:       {patchcore_model_dir.resolve()}")
-    print(f"bank dir:        {bank_dir.resolve()}")
-    print(f"shots/class:     {'ALL' if args.shots == 0 else args.shots}")
-    print("feature fusion:  50% DINOv2 CLS + 50% DINOv2 Patch Center")
+    print(f"product:          {args.product}")
+    print(f"defects dir:      {defects_dir}")
+    print(f"classes:          {[d.name for d in class_dirs]}")
+    print(f"PatchCore:        {patchcore_model_dir}")
+    print(f"inspection mode:  {inspection_mode}")
+    if inspection_mode == "tiled":
+        print(f"tile fraction:    {tile_fraction}")
+        print(f"tile overlap:     {tile_overlap}")
+    print(f"shots/class:      {'ALL' if args.shots == 0 else args.shots}")
+    print("feature fusion:   50% DINOv2 CLS + 50% DINOv2 Patch Center")
     print("=============================================")
 
     for class_dir in class_dirs:
@@ -197,38 +161,72 @@ def main():
             raise RuntimeError(f"Class {class_dir.name!r} has no images")
         if args.shots > 0 and len(images) < args.shots:
             raise RuntimeError(
-                f"Class {class_dir.name!r} has {len(images)} images, fewer than shots={args.shots}. "
-                "Use a smaller --shots or --shots 0."
+                f"Class {class_dir.name!r} has {len(images)} images, fewer than shots={args.shots}."
             )
         chosen = images if args.shots == 0 else images[: args.shots]
         class_counts[class_dir.name] = len(chosen)
         print(f"\n[{class_dir.name}] support={len(chosen)}")
 
         for image_path in chosen:
-            roi_result = pipeline.extract_roi(image_path)
-            cls_embedding = pipeline.embed_roi(roi_result["roi"], feature_mode="cls")
+            if inspection_mode == "tiled":
+                tiled = inspect_tiled_patchcore(
+                    pipeline.patchcore,
+                    image_path,
+                    tile_fraction=tile_fraction,
+                    overlap=tile_overlap,
+                    relative_threshold=args.bbox_relative_threshold,
+                )
+                if not tiled["regions"]:
+                    raise RuntimeError(
+                        f"No tiled anomaly region found for support image: {image_path}"
+                    )
+                primary = tiled["regions"][0]
+                original = Image.open(image_path).convert("RGB")
+                roi = crop_square_with_margin(
+                    original,
+                    primary["bbox"],
+                    margin=args.roi_margin,
+                )
+                anomaly_score = tiled["anomaly_score"]
+                bbox_for_log = primary["bbox"]
+                region_count = len(tiled["regions"])
+            else:
+                roi_result = pipeline.extract_roi(image_path)
+                roi = roi_result["roi"]
+                anomaly_score = roi_result["anomaly_score"]
+                bbox_for_log = roi_result["original_bbox"]
+                region_count = 1
+
+            cls_embedding = pipeline.embed_roi(roi, feature_mode="cls")
             center_embedding = pipeline.embed_roi(
-                roi_result["roi"],
+                roi,
                 feature_mode="patch_center",
                 center_fraction=args.center_fraction,
             )
-
             cls_embeddings.append(cls_embedding)
             center_embeddings.append(center_embedding)
             labels.append(class_dir.name)
             source_paths.append(str(image_path.resolve()))
 
-            roi_path = bank_dir / "support_rois" / class_dir.name / image_path.name
-            overlay_path = bank_dir / "support_overlays" / class_dir.name / image_path.name
+            roi_path = bank_dir / "support_rois" / class_dir.name / image_path.with_suffix(".png").name
+            overlay_path = bank_dir / "support_overlays" / class_dir.name / image_path.with_suffix(".jpg").name
             roi_path.parent.mkdir(parents=True, exist_ok=True)
-            roi_result["roi"].save(roi_path)
-            pipeline.save_bbox_overlay(
-                roi_result["display_image"], roi_result["bbox"], overlay_path
-            )
+            roi.save(roi_path)
+
+            if inspection_mode == "tiled":
+                save_regions_overlay(image_path, tiled["regions"], overlay_path)
+            else:
+                pipeline.save_full_image_overlay(
+                    image_path,
+                    roi_result["original_bbox"],
+                    overlay_path,
+                    label=class_dir.name,
+                    anomaly_score=anomaly_score,
+                )
 
             print(
-                f"  + {image_path.name} score={roi_result['anomaly_score']:.3f} "
-                f"bbox={roi_result['bbox']} original_bbox={roi_result['original_bbox']}"
+                f"  + {image_path.name} score={anomaly_score:.3f} "
+                f"primary_bbox={bbox_for_log} regions={region_count}"
             )
 
     cls_bank = DefectExemplarBank(np.stack(cls_embeddings), labels, source_paths)
@@ -238,16 +236,18 @@ def main():
 
     bank_dir.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "format_version": 2,
+        "format_version": 3,
         "product": args.product,
         "classes": cls_bank.classes,
         "class_counts": class_counts,
         "num_exemplars": len(labels),
+        "inspection_mode": inspection_mode,
+        "tile_fraction": tile_fraction if inspection_mode == "tiled" else None,
+        "tile_overlap": tile_overlap if inspection_mode == "tiled" else None,
         "features": ["dinov2_cls", "dinov2_patch_center"],
         "center_fraction": float(args.center_fraction),
         "fusion_cls_weight": 0.50,
         "fusion_center_weight": 0.50,
-        "class_score": "0.5*max_cosine_cls + 0.5*max_cosine_patch_center",
         "source": "PatchCore-predicted ROI; no GT mask used",
     }
     with open(bank_dir / "bank_config.json", "w", encoding="utf-8") as f:
