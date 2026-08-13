@@ -19,8 +19,8 @@ class PatchCoreDINOv2Pipeline:
 
     PatchCore answers where the anomaly is. The predicted anomaly ROI is then
     cropped from the same preprocessed image coordinate system and passed to a
-    frozen DINOv2 backbone. A small exemplar bank performs cosine-similarity
-    classification. No ground-truth mask is used by this class.
+    frozen DINOv2 backbone. The aligned ``anomaly_roi`` can additionally guide
+    DINOv2 patch-token pooling without using any ground-truth mask.
     """
 
     def __init__(
@@ -151,6 +151,38 @@ class PatchCoreDINOv2Pipeline:
 
         return roi, (left, top, right, bottom)
 
+    @staticmethod
+    def _crop_map_with_bbox(
+        map_image: np.ndarray,
+        crop_bbox: tuple[int, int, int, int],
+    ) -> np.ndarray:
+        """Crop a 2-D map using the exact ROI canvas coordinates.
+
+        Regions outside the image are padded with zeros, matching the RGB ROI's
+        padding geometry. This keeps PatchCore anomaly weights spatially aligned
+        with the DINOv2 ROI.
+        """
+        x1, y1, x2, y2 = crop_bbox
+        side_w = max(1, x2 - x1)
+        side_h = max(1, y2 - y1)
+        out = np.zeros((side_h, side_w), dtype=np.float32)
+
+        h, w = map_image.shape[:2]
+        src_left = max(0, x1)
+        src_top = max(0, y1)
+        src_right = min(w, x2)
+        src_bottom = min(h, y2)
+
+        if src_right > src_left and src_bottom > src_top:
+            dst_left = src_left - x1
+            dst_top = src_top - y1
+            dst_right = dst_left + (src_right - src_left)
+            dst_bottom = dst_top + (src_bottom - src_top)
+            out[dst_top:dst_bottom, dst_left:dst_right] = map_image[
+                src_top:src_bottom, src_left:src_right
+            ]
+        return out
+
     def extract_roi(self, image_path: str | Path) -> dict:
         if self.patchcore is None:
             raise RuntimeError("Pipeline is not loaded. Call load() first.")
@@ -187,10 +219,21 @@ class PatchCoreDINOv2Pipeline:
 
         roi, expanded_bbox = self._crop_square_with_margin(display_image, image_bbox)
 
+        display_norm = normalize_anomaly_map(anomaly_map)
+        if display_norm.shape != (display_image.height, display_image.width):
+            display_norm = cv2.resize(
+                display_norm,
+                display_image.size,
+                interpolation=cv2.INTER_LINEAR,
+            )
+        anomaly_roi = self._crop_map_with_bbox(display_norm, expanded_bbox)
+        anomaly_roi = normalize_anomaly_map(anomaly_roi)
+
         return {
             "image_path": str(image_path),
             "anomaly_score": float(patch_result["anomaly_score"]),
             "anomaly_map": anomaly_map,
+            "anomaly_roi": anomaly_roi,
             "bbox": tuple(int(v) for v in image_bbox),
             "expanded_bbox": tuple(int(v) for v in expanded_bbox),
             "bbox_source": bbox_source,
@@ -203,6 +246,7 @@ class PatchCoreDINOv2Pipeline:
         roi: Image.Image,
         feature_mode: Optional[str] = None,
         center_fraction: Optional[float] = None,
+        spatial_weights: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if self.dinov2 is None:
             raise RuntimeError("Pipeline is not loaded. Call load() first.")
@@ -214,6 +258,7 @@ class PatchCoreDINOv2Pipeline:
             center_fraction=(
                 self.center_fraction if center_fraction is None else center_fraction
             ),
+            spatial_weights=spatial_weights,
         )
 
     def classify(self, image_path: str | Path) -> dict:
@@ -223,7 +268,14 @@ class PatchCoreDINOv2Pipeline:
             )
 
         roi_result = self.extract_roi(image_path)
-        embedding = self.embed_roi(roi_result["roi"])
+        mode = self.dinov2_feature_mode
+        embedding = self.embed_roi(
+            roi_result["roi"],
+            feature_mode=mode,
+            spatial_weights=(
+                roi_result["anomaly_roi"] if mode == "patch_weighted" else None
+            ),
+        )
         classification = self.bank.predict_embedding(embedding)
         return {**roi_result, **classification, "embedding": embedding}
 
