@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -23,6 +24,22 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+def adaptive_avg_projection(input_dim: int, output_dim: int) -> torch.Tensor:
+    """Build a fixed linear projection exactly matching AdaptiveAvgPool1d.
+
+    The legacy ONNX exporter cannot export adaptive_avg_pool1d when its input
+    length is hidden behind a dynamic reshape. PatchCore's feature dimensions
+    are fixed for the 320px WRN50 layer2/layer3 graph, so the same pooling can
+    be represented as a constant matrix multiplication.
+    """
+    projection = torch.zeros(input_dim, output_dim, dtype=torch.float32)
+    for out_index in range(output_dim):
+        start = math.floor(out_index * input_dim / output_dim)
+        end = math.ceil((out_index + 1) * input_dim / output_dim)
+        projection[start:end, out_index] = 1.0 / float(end - start)
+    return projection
 
 
 class PatchCoreFeatureExport(nn.Module):
@@ -59,6 +76,26 @@ class PatchCoreFeatureExport(nn.Module):
         self.layer2_grid = self.input_size // 8
         self.layer3_grid = self.input_size // 16
 
+        layer2_patch_dim = 512 * self.patch_size * self.patch_size
+        layer3_patch_dim = 1024 * self.patch_size * self.patch_size
+        aggregate_input_dim = 2 * self.pretrain_dim
+
+        self.register_buffer(
+            "layer2_pool_projection",
+            adaptive_avg_projection(layer2_patch_dim, self.pretrain_dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "layer3_pool_projection",
+            adaptive_avg_projection(layer3_patch_dim, self.pretrain_dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "aggregate_pool_projection",
+            adaptive_avg_projection(aggregate_input_dim, self.target_dim),
+            persistent=False,
+        )
+
     def _backbone_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         b = self.backbone
         x = b.conv1(x)
@@ -78,21 +115,15 @@ class PatchCoreFeatureExport(nn.Module):
             padding=self.padding,
         ).transpose(1, 2)
 
-    def _mean_map(self, x: torch.Tensor) -> torch.Tensor:
-        batch, patches, dim = x.shape
-        x = x.reshape(batch * patches, 1, dim)
-        x = F.adaptive_avg_pool1d(x, self.pretrain_dim).squeeze(1)
-        return x.reshape(batch, patches, self.pretrain_dim)
-
     def _embed(self, images: torch.Tensor) -> torch.Tensor:
         layer2, layer3 = self._backbone_features(images)
 
         patch2 = self._patchify(layer2)
         patch3 = self._patchify(layer3)
 
-        b = patch3.shape[0]
+        batch = patch3.shape[0]
         patch3_map = patch3.transpose(1, 2).reshape(
-            b, patch3.shape[-1], self.layer3_grid, self.layer3_grid
+            batch, patch3.shape[-1], self.layer3_grid, self.layer3_grid
         )
         patch3_map = F.interpolate(
             patch3_map,
@@ -102,14 +133,15 @@ class PatchCoreFeatureExport(nn.Module):
         )
         patch3 = patch3_map.flatten(2).transpose(1, 2)
 
-        mapped2 = self._mean_map(patch2)
-        mapped3 = self._mean_map(patch3)
+        # Numerically equivalent to patchcore.common.MeanMapper's
+        # adaptive_avg_pool1d, but represented with ONNX-friendly MatMul.
+        mapped2 = torch.matmul(patch2, self.layer2_pool_projection)
+        mapped3 = torch.matmul(patch3, self.layer3_pool_projection)
 
-        merged = torch.stack((mapped2, mapped3), dim=2)
-        b, n, layers, dim = merged.shape
-        merged = merged.reshape(b * n, 1, layers * dim)
-        merged = F.adaptive_avg_pool1d(merged, self.target_dim).squeeze(1)
-        return merged.reshape(b, n, self.target_dim)
+        # Equivalent to stack(layer2, layer3) -> flatten -> Aggregator.
+        merged = torch.cat((mapped2, mapped3), dim=-1)
+        embeddings = torch.matmul(merged, self.aggregate_pool_projection)
+        return embeddings
 
     def forward(
         self,
@@ -186,8 +218,8 @@ def load_patchcore_backbone(device: torch.device) -> nn.Module:
     backbone.load_state_dict(state, strict=True)
     log(f"[1/4] Moving PatchCore backbone to {device}...")
     backbone.eval().to(device)
-    for p in backbone.parameters():
-        p.requires_grad_(False)
+    for parameter in backbone.parameters():
+        parameter.requires_grad_(False)
     log("[1/4] PatchCore backbone ready.")
     return backbone
 
@@ -211,8 +243,8 @@ def load_dinov2(device: torch.device) -> nn.Module:
     )
     log(f"[3/4] Moving DINOv2 to {device}...")
     model.eval().to(device)
-    for p in model.parameters():
-        p.requires_grad_(False)
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
     log("[3/4] DINOv2 ready.")
     return model
 
@@ -471,35 +503,35 @@ def write_engine_config(output_dir: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Export generic PatchCore + DINOv2 ONNX inference engine."
     )
-    p.add_argument(
+    parser.add_argument(
         "--output-dir",
         default=str(DEPLOY_ROOT / "models"),
         help="Output folder for generic ONNX files.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--model",
         choices=["all", "patchcore", "dinov2"],
         default="all",
         help="Export both models or isolate one model for troubleshooting.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--device",
         default="cpu",
         choices=["cpu", "cuda"],
         help="Export device. CPU is recommended on Windows; runtime can still use CUDA.",
     )
-    p.add_argument(
+    parser.add_argument(
         "--exporter",
         choices=["legacy", "dynamo"],
         default="legacy",
         help="Legacy is the stable default for these fixed inference graphs on Windows.",
     )
-    p.add_argument("--opset", type=int, default=18)
-    p.add_argument("--skip-verify", action="store_true")
-    return p.parse_args()
+    parser.add_argument("--opset", type=int, default=18)
+    parser.add_argument("--skip-verify", action="store_true")
+    return parser.parse_args()
 
 
 def main() -> None:
