@@ -18,6 +18,7 @@ public sealed record ProductBuildDefinition
     public float TileFraction { get; init; } = 0.75f;
     public float TileOverlap { get; init; } = 0.25f;
     public float CoresetRatio { get; init; } = 0.10f;
+    public int MaxPatchCoreMemoryRows { get; init; } = 16000;
     public float BboxRelativeThreshold { get; init; } = 0.70f;
     public float RoiMargin { get; init; } = 0.50f;
     public float ClsWeight { get; init; } = 0.50f;
@@ -54,14 +55,23 @@ public sealed record PatchCoreEngineManifest
     [JsonPropertyName("input")]
     public required string Input { get; init; }
 
+    [JsonPropertyName("memory_input")]
+    public required string MemoryInput { get; init; }
+
     [JsonPropertyName("input_shape")]
     public required int[] InputShape { get; init; }
 
-    [JsonPropertyName("output")]
-    public required string Output { get; init; }
+    [JsonPropertyName("outputs")]
+    public required string[] Outputs { get; init; }
 
     [JsonPropertyName("output_shape")]
     public required int[] OutputShape { get; init; }
+
+    [JsonPropertyName("score_shape")]
+    public required int[] ScoreShape { get; init; }
+
+    [JsonPropertyName("score_metric")]
+    public required string ScoreMetric { get; init; }
 
     [JsonPropertyName("patch_grid")]
     public required int[] PatchGrid { get; init; }
@@ -118,6 +128,8 @@ public sealed record ProductModelManifest
     public float TileFraction { get; init; }
     public float TileOverlap { get; init; }
     public float CoresetRatio { get; init; }
+    public int PatchCoreMemoryRows { get; init; }
+    public string PatchCoreMemoryStrategy { get; init; } = "bounded_reservoir";
     public float BboxRelativeThreshold { get; init; }
     public float RoiMargin { get; init; }
     public float ClsWeight { get; init; }
@@ -132,3 +144,8 @@ public sealed record ProductModelManifest
         );
     }
 }
+
+public sealed record PatchCoreOnnxResult(
+    BinaryMatrix Embeddings,
+    float[] PatchScores
+);
