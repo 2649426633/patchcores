@@ -122,13 +122,16 @@ public sealed class PatchCoreTiledInspector
             var sy = window.Height / (float)anomalyMap.Height;
             foreach (var local in regions)
             {
-                var bbox = new Rect(
-                    (int)Math.Round(window.X1 + local.Bbox.X * sx),
-                    (int)Math.Round(window.Y1 + local.Bbox.Y * sy),
-                    Math.Max(1, (int)Math.Round(local.Bbox.Width * sx)),
-                    Math.Max(1, (int)Math.Round(local.Bbox.Height * sy))
+                var x1 = (int)Math.Round(window.X1 + local.Bbox.Left * sx);
+                var y1 = (int)Math.Round(window.Y1 + local.Bbox.Top * sy);
+                var x2 = (int)Math.Round(window.X1 + local.Bbox.Right * sx);
+                var y2 = (int)Math.Round(window.Y1 + local.Bbox.Bottom * sy);
+                var bbox = ClipRect(
+                    new Rect(x1, y1, Math.Max(1, x2 - x1), Math.Max(1, y2 - y1)),
+                    image.Width,
+                    image.Height
                 );
-                bbox = ClipRect(bbox, image.Width, image.Height);
+
                 var rank = tileScore * (0.50f + 0.50f * local.Evidence);
                 candidates.Add(new AnomalyRegion(
                     bbox,
@@ -198,19 +201,17 @@ public sealed class PatchCoreTiledInspector
         if (patchScores.Length != grid[0] * grid[1])
             throw new InvalidDataException("Patch score count does not match configured grid.");
 
-        var patchMap = new Mat(grid[0], grid[1], MatType.CV_32FC1);
+        using var patchMap = new Mat(grid[0], grid[1], MatType.CV_32FC1);
         for (var y = 0; y < grid[0]; y++)
         for (var x = 0; x < grid[1]; x++)
             patchMap.Set(y, x, patchScores[y * grid[1] + x]);
 
         var size = _engine.Manifest.PatchCore.InputShape[2];
-        var resized = new Mat();
+        using var resized = new Mat();
         Cv2.Resize(patchMap, resized, new Size(size, size), 0, 0, InterpolationFlags.Linear);
-        patchMap.Dispose();
 
         var smoothed = new Mat();
         Cv2.GaussianBlur(resized, smoothed, new Size(0, 0), 4.0, 4.0);
-        resized.Dispose();
         return smoothed;
     }
 
@@ -230,7 +231,7 @@ public sealed class PatchCoreTiledInspector
         using var binary = new Mat();
         binaryFloat.ConvertTo(binary, MatType.CV_8UC1, 255.0);
 
-        using var kernel = Mat.Ones(3, 3, MatType.CV_8UC1);
+        using var kernel = new Mat(3, 3, MatType.CV_8UC1, Scalar.All(1));
         using var closed = new Mat();
         Cv2.MorphologyEx(binary, closed, MorphTypes.Close, kernel);
 
@@ -270,8 +271,7 @@ public sealed class PatchCoreTiledInspector
 
             values.Sort();
             var peak = values[^1];
-            var q90Index = Math.Clamp((int)Math.Floor(0.90 * (values.Count - 1)), 0, values.Count - 1);
-            var q90 = values[q90Index];
+            var q90 = Quantile(values, 0.90);
             var mean = values.Average();
             var evidence = 0.55f * peak + 0.30f * q90 + 0.15f * mean;
             var touches = x <= 1 || y <= 1 || x + w >= smooth.Width - 1 || y + h >= smooth.Height - 1;
@@ -290,15 +290,26 @@ public sealed class PatchCoreTiledInspector
             .ToList();
     }
 
+    private static float Quantile(List<float> sortedValues, double q)
+    {
+        if (sortedValues.Count == 1)
+            return sortedValues[0];
+        var position = q * (sortedValues.Count - 1);
+        var lo = (int)Math.Floor(position);
+        var hi = (int)Math.Ceiling(position);
+        if (lo == hi)
+            return sortedValues[lo];
+        var t = (float)(position - lo);
+        return sortedValues[lo] * (1f - t) + sortedValues[hi] * t;
+    }
+
     private static Mat Normalize(Mat source)
     {
         Cv2.MinMaxLoc(source, out var min, out var max);
-        var output = new Mat();
         if (max - min < 1e-12)
-        {
-            output = Mat.Zeros(source.Rows, source.Cols, MatType.CV_32FC1);
-            return output;
-        }
+            return new Mat(source.Rows, source.Cols, MatType.CV_32FC1, Scalar.All(0));
+
+        var output = new Mat();
         source.ConvertTo(output, MatType.CV_32FC1, 1.0 / (max - min), -min / (max - min));
         return output;
     }
