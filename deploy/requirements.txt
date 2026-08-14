@@ -1,0 +1,5 @@
+# Install torch/torchvision separately to match the local CUDA environment.
+onnx>=1.18
+onnxruntime>=1.22
+onnxscript
+numpy
