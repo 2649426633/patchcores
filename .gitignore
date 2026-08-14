@@ -19,6 +19,14 @@ Thumbs.db
 /outputs/
 /checkpoints/
 
+# Deployment-generated models / outputs
+/deploy/models/
+/deploy/products/
+/deploy/outputs/
+*.onnx
+**/bin/
+**/obj/
+
 # Model weights and generated indexes
 *.pth
 *.pt
