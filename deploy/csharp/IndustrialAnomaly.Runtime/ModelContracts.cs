@@ -19,7 +19,7 @@ public sealed record ProductBuildDefinition
     public float TileOverlap { get; init; } = 0.25f;
     public float CoresetRatio { get; init; } = 0.10f;
     public int MaxPatchCoreMemoryRows { get; init; } = 16000;
-    public float BboxRelativeThreshold { get; init; } = 0.70f;
+    public float BboxRelativeThreshold { get; init; } = 0.78f;
     public float RoiMargin { get; init; } = 0.50f;
     public float ClsWeight { get; init; } = 0.50f;
     public float CenterWeight { get; init; } = 0.50f;
