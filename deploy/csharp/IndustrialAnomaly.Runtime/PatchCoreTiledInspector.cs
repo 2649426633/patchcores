@@ -305,7 +305,7 @@ public sealed class PatchCoreTiledInspector
 
     private static Mat Normalize(Mat source)
     {
-        Cv2.MinMaxLoc(source, out var min, out var max);
+        Cv2.MinMaxLoc(source, out double min, out double max);
         if (max - min < 1e-12)
             return new Mat(source.Rows, source.Cols, MatType.CV_32FC1, Scalar.All(0));
 
@@ -381,6 +381,8 @@ public sealed class PatchCoreTiledInspector
         var b = new List<byte>();
         var g = new List<byte>();
         var r = new List<byte>();
+        var width = image.Width;
+        var height = image.Height;
 
         void AddPixel(Vec3b p)
         {
@@ -389,15 +391,15 @@ public sealed class PatchCoreTiledInspector
             r.Add(p.Item2);
         }
 
-        for (var x = 0; x < image.Width; x++)
+        for (var x = 0; x < width; x++)
         {
             AddPixel(image.At<Vec3b>(0, x));
-            AddPixel(image.At<Vec3b>(image.Height - 1, x));
+            AddPixel(image.At<Vec3b>(height - 1, x));
         }
-        for (var y = 0; y < image.Height; y++)
+        for (var y = 0; y < height; y++)
         {
             AddPixel(image.At<Vec3b>(y, 0));
-            AddPixel(image.At<Vec3b>(y, image.Width - 1));
+            AddPixel(image.At<Vec3b>(y, width - 1));
         }
 
         static byte Median(List<byte> values)
