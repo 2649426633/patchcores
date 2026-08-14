@@ -26,30 +26,66 @@ public sealed class OnnxFeatureEngine : IDisposable
 
     public BinaryMatrix ExtractPatchCoreEmbeddings(Mat bgrImage)
     {
+        return RunPatchCore(bgrImage, null).Embeddings;
+    }
+
+    public PatchCoreOnnxResult RunPatchCore(Mat bgrImage, BinaryMatrix? memoryBank)
+    {
         if (bgrImage.Empty())
             throw new ArgumentException("Input image is empty.", nameof(bgrImage));
 
-        var size = _manifest.PatchCore.InputShape[2];
+        var cfg = _manifest.PatchCore;
+        var size = cfg.InputShape[2];
         var inputData = PrepareImage(bgrImage, size);
-        long[] shape = [1, 3, size, size];
+        long[] imageShape = [1, 3, size, size];
 
-        using var input = OrtValue.CreateTensorValueFromMemory(inputData, shape);
+        var memory = memoryBank ?? new BinaryMatrix(
+            1,
+            cfg.EmbeddingDim,
+            new float[cfg.EmbeddingDim]
+        );
+        if (memory.Cols != cfg.EmbeddingDim)
+        {
+            throw new ArgumentException(
+                $"PatchCore memory dimension is {memory.Cols}; expected {cfg.EmbeddingDim}.",
+                nameof(memoryBank)
+            );
+        }
+        long[] memoryShape = [memory.Rows, memory.Cols];
+
+        using var imageInput = OrtValue.CreateTensorValueFromMemory(inputData, imageShape);
+        using var memoryInput = OrtValue.CreateTensorValueFromMemory(memory.Data, memoryShape);
         var inputs = new Dictionary<string, OrtValue>
         {
-            [_manifest.PatchCore.Input] = input,
+            [cfg.Input] = imageInput,
+            [cfg.MemoryInput] = memoryInput,
         };
+
         using var runOptions = new RunOptions();
         using var outputs = _patchCoreSession.Run(
             runOptions,
             inputs,
-            _patchCoreSession.OutputNames[0]
+            _patchCoreSession.OutputNames
         );
+        if (outputs.Count != 2)
+            throw new InvalidDataException(
+                $"PatchCore ONNX returned {outputs.Count} outputs; expected 2."
+            );
 
-        var output = outputs[0];
-        var values = output.GetTensorDataAsSpan<float>().ToArray();
-        var rows = _manifest.PatchCore.OutputShape[1];
-        var cols = _manifest.PatchCore.EmbeddingDim;
-        return new BinaryMatrix(rows, cols, values);
+        var embeddingValues = outputs[0].GetTensorDataAsSpan<float>().ToArray();
+        var scores = outputs[1].GetTensorDataAsSpan<float>().ToArray();
+        var rows = cfg.OutputShape[1];
+        var cols = cfg.EmbeddingDim;
+
+        if (embeddingValues.Length != rows * cols)
+            throw new InvalidDataException("Unexpected PatchCore embedding output shape.");
+        if (scores.Length != rows)
+            throw new InvalidDataException("Unexpected PatchCore score output shape.");
+
+        return new PatchCoreOnnxResult(
+            new BinaryMatrix(rows, cols, embeddingValues),
+            scores
+        );
     }
 
     public (float[] Cls, float[] Center) ExtractDinoEmbeddings(Mat bgrImage)
