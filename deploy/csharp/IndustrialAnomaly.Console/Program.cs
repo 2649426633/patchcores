@@ -79,9 +79,17 @@ try
         Console.WriteLine($"PatchCore={result.PatchCoreAnomalyScore:F6}");
         Console.WriteLine($"decision={result.AnomalyDecision}");
         Console.WriteLine($"bbox={result.Bbox}");
-        Console.WriteLine($"class={result.PredictedDefect}");
-        Console.WriteLine($"similarity={result.Top1Similarity:F6}");
-        Console.WriteLine($"margin={result.Margin:F6}");
+        Console.WriteLine($"class={result.PredictedDefect ?? "-"}");
+        Console.WriteLine(
+            result.Top1Similarity.HasValue
+                ? $"similarity={result.Top1Similarity.Value:F6}"
+                : "similarity=-"
+        );
+        Console.WriteLine(
+            result.Margin.HasValue
+                ? $"margin={result.Margin.Value:F6}"
+                : "margin=-"
+        );
         Console.WriteLine($"final={result.FinalResult}");
         Console.WriteLine($"marked={Path.GetFullPath(markedOutput)}");
         return 0;
