@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 from pathlib import Path
 
@@ -24,15 +23,18 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 class PatchCoreFeatureExport(nn.Module):
-    """Export the exact PatchCore patch embedding path used by this repository.
+    """Generic PatchCore ONNX graph with a runtime-supplied memory bank.
 
-    Input is already-resized/normalized NCHW RGB. The output is the final
-    PatchCore embedding before nearest-neighbour scoring:
+    Inputs:
+        images:      [B, 3, 320, 320]
+        memory_bank: [M, 1024]  (dynamic M; product-specific, created in C#)
 
-        [B, 3, 320, 320] -> [B, 1600, 1024]
+    Outputs:
+        patch_embeddings: [B, 1600, 1024]
+        patch_scores:     [B, 1600]
 
-    The graph mirrors patchcore.PatchCore._embed for layer2 + layer3,
-    patchsize=3, stride=1, pretrain_dim=1024 and target_dim=1024.
+    ``patch_scores`` are minimum squared-L2 distances, matching FAISS
+    ``IndexFlatL2`` used by the Python implementation.
     """
 
     def __init__(
@@ -70,7 +72,6 @@ class PatchCoreFeatureExport(nn.Module):
         return layer2, layer3
 
     def _patchify(self, x: torch.Tensor) -> torch.Tensor:
-        # F.unfold: [B, C*P*P, N] -> [B, N, C*P*P]
         return F.unfold(
             x,
             kernel_size=self.patch_size,
@@ -79,20 +80,17 @@ class PatchCoreFeatureExport(nn.Module):
         ).transpose(1, 2)
 
     def _mean_map(self, x: torch.Tensor) -> torch.Tensor:
-        # Equivalent to patchcore.common.MeanMapper.
         batch, patches, dim = x.shape
         x = x.reshape(batch * patches, 1, dim)
         x = F.adaptive_avg_pool1d(x, self.pretrain_dim).squeeze(1)
         return x.reshape(batch, patches, self.pretrain_dim)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def _embed(self, images: torch.Tensor) -> torch.Tensor:
         layer2, layer3 = self._backbone_features(images)
 
         patch2 = self._patchify(layer2)
         patch3 = self._patchify(layer3)
 
-        # Match PatchCore's spatial interpolation of layer3 patch vectors onto
-        # the layer2 patch grid. Every C/P/P element is interpolated independently.
         b = patch3.shape[0]
         patch3_map = patch3.transpose(1, 2).reshape(
             b, patch3.shape[-1], self.layer3_grid, self.layer3_grid
@@ -108,19 +106,34 @@ class PatchCoreFeatureExport(nn.Module):
         mapped2 = self._mean_map(patch2)
         mapped3 = self._mean_map(patch3)
 
-        # Equivalent to patchcore.common.Aggregator over two 1024-d features.
         merged = torch.stack((mapped2, mapped3), dim=2)
         b, n, layers, dim = merged.shape
         merged = merged.reshape(b * n, 1, layers * dim)
         merged = F.adaptive_avg_pool1d(merged, self.target_dim).squeeze(1)
         return merged.reshape(b, n, self.target_dim)
 
+    def forward(
+        self,
+        images: torch.Tensor,
+        memory_bank: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        embeddings = self._embed(images)
+
+        query = embeddings.reshape(-1, self.target_dim)
+        query_sq = (query * query).sum(dim=1, keepdim=True)
+        memory_sq = (memory_bank * memory_bank).sum(dim=1).unsqueeze(0)
+        squared_l2 = query_sq + memory_sq - 2.0 * (query @ memory_bank.transpose(0, 1))
+        squared_l2 = torch.clamp(squared_l2, min=0.0)
+        patch_scores = torch.min(squared_l2, dim=1).values
+        patch_scores = patch_scores.reshape(embeddings.shape[0], embeddings.shape[1])
+        return embeddings, patch_scores
+
 
 class DINOv2FeatureExport(nn.Module):
-    """Frozen DINOv2 ViT-S/14 feature exporter used by the defect bank.
+    """Frozen DINOv2 ViT-S/14 production feature exporter.
 
-    Outputs the two production features currently used by the project:
-    L2-normalized CLS and L2-normalized center-patch pooled embeddings.
+    Output 1: L2-normalized CLS embedding [B, 384]
+    Output 2: L2-normalized center-patch embedding [B, 384]
     """
 
     def __init__(
@@ -199,51 +212,144 @@ def load_dinov2(device: torch.device) -> nn.Module:
     return model
 
 
-def export_model(
-    model: nn.Module,
-    dummy: torch.Tensor,
+def export_patchcore(
+    model: PatchCoreFeatureExport,
+    image_dummy: torch.Tensor,
+    memory_dummy: torch.Tensor,
     output_path: Path,
-    output_names: list[str],
     opset: int,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.eval()
 
-    common = dict(
-        input_names=["images"],
-        output_names=output_names,
-        opset_version=opset,
-        export_params=True,
-    )
+    try:
+        torch.onnx.export(
+            model,
+            (image_dummy, memory_dummy),
+            str(output_path),
+            input_names=["images", "memory_bank"],
+            output_names=["patch_embeddings", "patch_scores"],
+            opset_version=opset,
+            export_params=True,
+            dynamo=True,
+            optimize=True,
+            dynamic_shapes={
+                "images": {0: torch.export.Dim("batch", min=1)},
+                "memory_bank": {0: torch.export.Dim("memory_rows", min=1)},
+            },
+        )
+        exporter = "dynamo"
+    except Exception as exc:
+        print(f"[ONNX] PatchCore dynamo export failed: {type(exc).__name__}: {exc}")
+        print("[ONNX] retrying PatchCore with legacy exporter...")
+        torch.onnx.export(
+            model,
+            (image_dummy, memory_dummy),
+            str(output_path),
+            input_names=["images", "memory_bank"],
+            output_names=["patch_embeddings", "patch_scores"],
+            opset_version=opset,
+            export_params=True,
+            dynamo=False,
+            do_constant_folding=True,
+            dynamic_axes={
+                "images": {0: "batch"},
+                "memory_bank": {0: "memory_rows"},
+                "patch_embeddings": {0: "batch"},
+                "patch_scores": {0: "batch"},
+            },
+        )
+        exporter = "legacy"
+
+    print(f"[ONNX] PatchCore exported ({exporter}): {output_path.resolve()}")
+
+
+def export_dino(
+    model: DINOv2FeatureExport,
+    dummy: torch.Tensor,
+    output_path: Path,
+    opset: int,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    model.eval()
 
     try:
         torch.onnx.export(
             model,
             (dummy,),
             str(output_path),
+            input_names=["images"],
+            output_names=["cls_embedding", "center_embedding"],
+            opset_version=opset,
+            export_params=True,
             dynamo=True,
             optimize=True,
-            **common,
+            dynamic_shapes={"images": {0: torch.export.Dim("batch", min=1)}},
         )
         exporter = "dynamo"
     except Exception as exc:
-        print(f"[ONNX] dynamo exporter failed: {type(exc).__name__}: {exc}")
-        print("[ONNX] retrying with legacy exporter for compatibility...")
+        print(f"[ONNX] DINOv2 dynamo export failed: {type(exc).__name__}: {exc}")
+        print("[ONNX] retrying DINOv2 with legacy exporter...")
         torch.onnx.export(
             model,
             dummy,
             str(output_path),
+            input_names=["images"],
+            output_names=["cls_embedding", "center_embedding"],
+            opset_version=opset,
+            export_params=True,
             dynamo=False,
             do_constant_folding=True,
-            **common,
+            dynamic_axes={
+                "images": {0: "batch"},
+                "cls_embedding": {0: "batch"},
+                "center_embedding": {0: "batch"},
+            },
         )
         exporter = "legacy"
 
-    print(f"[ONNX] exported ({exporter}): {output_path.resolve()}")
+    print(f"[ONNX] DINOv2 exported ({exporter}): {output_path.resolve()}")
 
 
-def verify_onnx(
-    model: nn.Module,
+def verify_patchcore(
+    model: PatchCoreFeatureExport,
+    image_dummy: torch.Tensor,
+    memory_dummy: torch.Tensor,
+    onnx_path: Path,
+) -> None:
+    try:
+        import onnx
+        import onnxruntime as ort
+    except ImportError:
+        print("[ONNX] verification skipped: install deploy/requirements.txt")
+        return
+
+    onnx.checker.check_model(onnx.load(str(onnx_path)))
+    with torch.inference_mode():
+        pt_outputs = model(image_dummy, memory_dummy)
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    ort_outputs = session.run(
+        None,
+        {
+            "images": image_dummy.detach().cpu().numpy(),
+            "memory_bank": memory_dummy.detach().cpu().numpy(),
+        },
+    )
+    for index, (pt, ort_out) in enumerate(zip(pt_outputs, ort_outputs)):
+        pt_np = pt.detach().cpu().numpy()
+        if pt_np.shape != ort_out.shape:
+            raise RuntimeError(
+                f"PatchCore output {index} shape mismatch: {pt_np.shape} vs {ort_out.shape}"
+            )
+        print(
+            f"[ONNX] PatchCore verify[{index}] shape={pt_np.shape} "
+            f"max_abs={float(np.max(np.abs(pt_np - ort_out))):.6g}"
+        )
+
+
+def verify_dino(
+    model: DINOv2FeatureExport,
     dummy: torch.Tensor,
     onnx_path: Path,
 ) -> None:
@@ -254,32 +360,27 @@ def verify_onnx(
         print("[ONNX] verification skipped: install deploy/requirements.txt")
         return
 
-    onnx_model = onnx.load(str(onnx_path))
-    onnx.checker.check_model(onnx_model)
-
+    onnx.checker.check_model(onnx.load(str(onnx_path)))
     with torch.inference_mode():
-        torch_outputs = model(dummy)
-    if isinstance(torch_outputs, torch.Tensor):
-        torch_outputs = (torch_outputs,)
+        pt_outputs = model(dummy)
 
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     ort_outputs = session.run(None, {"images": dummy.detach().cpu().numpy()})
-    if len(torch_outputs) != len(ort_outputs):
-        raise RuntimeError("ONNX output count differs from PyTorch")
-
-    for index, (pt, ort_out) in enumerate(zip(torch_outputs, ort_outputs)):
+    for index, (pt, ort_out) in enumerate(zip(pt_outputs, ort_outputs)):
         pt_np = pt.detach().cpu().numpy()
         if pt_np.shape != ort_out.shape:
             raise RuntimeError(
-                f"Output {index} shape mismatch: PyTorch={pt_np.shape}, ONNX={ort_out.shape}"
+                f"DINOv2 output {index} shape mismatch: {pt_np.shape} vs {ort_out.shape}"
             )
-        max_abs = float(np.max(np.abs(pt_np - ort_out)))
-        print(f"[ONNX] verify output[{index}] shape={pt_np.shape} max_abs={max_abs:.6g}")
+        print(
+            f"[ONNX] DINOv2 verify[{index}] shape={pt_np.shape} "
+            f"max_abs={float(np.max(np.abs(pt_np - ort_out))):.6g}"
+        )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Export generic PatchCore and DINOv2 feature extractors to ONNX."
+        description="Export generic PatchCore + DINOv2 ONNX inference engine."
     )
     p.add_argument(
         "--output-dir",
@@ -294,7 +395,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu"
+    )
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -307,32 +410,35 @@ def main() -> None:
 
     patchcore = PatchCoreFeatureExport(load_patchcore_backbone(device)).to(device).eval()
     patch_dummy = torch.randn(1, 3, 320, 320, device=device, dtype=torch.float32)
+    memory_dummy = torch.randn(32, 1024, device=device, dtype=torch.float32)
     patch_path = output_dir / "patchcore_feature.onnx"
-    export_model(patchcore, patch_dummy, patch_path, ["patch_embeddings"], args.opset)
+    export_patchcore(patchcore, patch_dummy, memory_dummy, patch_path, args.opset)
     if not args.skip_verify:
-        verify_onnx(patchcore.cpu(), patch_dummy.cpu(), patch_path)
+        verify_patchcore(
+            patchcore.cpu(),
+            patch_dummy.cpu(),
+            memory_dummy.cpu(),
+            patch_path,
+        )
 
     dinov2 = DINOv2FeatureExport(load_dinov2(device)).to(device).eval()
     dino_dummy = torch.randn(1, 3, 224, 224, device=device, dtype=torch.float32)
     dino_path = output_dir / "dinov2_feature.onnx"
-    export_model(
-        dinov2,
-        dino_dummy,
-        dino_path,
-        ["cls_embedding", "center_embedding"],
-        args.opset,
-    )
+    export_dino(dinov2, dino_dummy, dino_path, args.opset)
     if not args.skip_verify:
-        verify_onnx(dinov2.cpu(), dino_dummy.cpu(), dino_path)
+        verify_dino(dinov2.cpu(), dino_dummy.cpu(), dino_path)
 
     config = {
-        "format_version": 1,
+        "format_version": 2,
         "patchcore": {
             "file": patch_path.name,
             "input": "images",
+            "memory_input": "memory_bank",
             "input_shape": [1, 3, 320, 320],
-            "output": "patch_embeddings",
+            "outputs": ["patch_embeddings", "patch_scores"],
             "output_shape": [1, 1600, 1024],
+            "score_shape": [1, 1600],
+            "score_metric": "min_squared_l2",
             "patch_grid": [40, 40],
             "embedding_dim": 1024,
             "layers": ["layer2", "layer3"],
@@ -356,7 +462,9 @@ def main() -> None:
         },
     }
     config_path = output_dir / "engine_config.json"
-    config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    config_path.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     print(f"[ONNX] engine config: {config_path.resolve()}")
     print("\nGeneric ONNX engine export finished.")
 
