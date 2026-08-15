@@ -3,20 +3,12 @@ using System.Text.Json.Serialization;
 
 namespace IndustrialAnomaly.Runtime;
 
-[Obsolete(
-    "C# product rebuilding is disabled for production parity. Convert the original Python PatchCore/DINO banks with deploy/convert_python_product.py instead.",
-    true
-)]
 public sealed record DefectClassDefinition
 {
     public required string Name { get; init; }
     public required string ImageDirectory { get; init; }
 }
 
-[Obsolete(
-    "C# product rebuilding is disabled for production parity. Convert the original Python PatchCore/DINO banks with deploy/convert_python_product.py instead.",
-    true
-)]
 public sealed record ProductBuildDefinition
 {
     public required string ProductName { get; init; }
