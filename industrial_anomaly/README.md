@@ -8,9 +8,11 @@
 industrial_anomaly/
 ├── train_patchcore.py       # 正常图 → PatchCore + Greedy Coreset + FAISS
 ├── build_defect_bank.py     # 已知缺陷 → PatchCore ROI → DINOv2 exemplar bank
-├── inspect.py               # 单图 / 文件夹统一验收
+├── run_inspection.py        # 单图 / 文件夹统一验收
 └── README.md
 ```
+
+> 不使用 `inspect.py` 作为脚本名，因为它会覆盖 Python 标准库 `inspect`，导致 NumPy / PyTorch 等第三方库导入异常。
 
 ## 1. 数据结构
 
@@ -120,18 +122,18 @@ products/<product>/models/defect_bank/
 
 ## 4. Python 验收
 
-现在单图和文件夹统一用 `inspect.py`。
+现在单图和文件夹统一用 `run_inspection.py`。
 
 文件夹：
 
 ```powershell
-python inspect.py ..\data\phone\test --product phone
+python run_inspection.py ..\data\phone\test --product phone
 ```
 
 单图：
 
 ```powershell
-python inspect.py ..\data\phone\test\Image_3.bmp --product phone
+python run_inspection.py ..\data\phone\test\Image_3.bmp --product phone
 ```
 
 脚本会自动读取：
