@@ -11,17 +11,26 @@ env/
 .DS_Store
 Thumbs.db
 
-# Local datasets and generated product data
-/data/
+# Local datasets: keep only the placement README
+/data/*
+!/data/README.md
+
+# Python-generated product data / outputs
 /industrial_anomaly/products/
 /industrial_anomaly/outputs/
 /products/
 /outputs/
 /checkpoints/
 
-# Deployment-generated models / outputs
-/deploy/models/
-/deploy/products/
+# Deployment-generated ONNX engines: keep only placement README
+/deploy/models/*
+!/deploy/models/README.md
+
+# Deployment product packages converted from Python models
+/deploy/products/*
+!/deploy/products/README.md
+
+# Deployment outputs
 /deploy/outputs/
 *.onnx
 **/bin/
