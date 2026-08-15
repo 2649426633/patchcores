@@ -4,8 +4,12 @@ static int Usage()
 {
     Console.WriteLine("IndustrialAnomaly.Console");
     Console.WriteLine();
-    Console.WriteLine("Build product model:");
-    Console.WriteLine("  build <engineDir> <outputRoot> <productName> <normalDir> <class=folder> [class=folder ...]");
+    Console.WriteLine("IMPORTANT:");
+    Console.WriteLine("  Production product models must come from the original Python-trained banks.");
+    Console.WriteLine("  Convert them with deploy/convert_python_product.py; C# rebuilding is disabled.");
+    Console.WriteLine();
+    Console.WriteLine("Validate converted product:");
+    Console.WriteLine("  validate-product <engineDir> <productDir>");
     Console.WriteLine();
     Console.WriteLine("Inspect image:");
     Console.WriteLine("  inspect <engineDir> <productDir> <imagePath> <markedOutput> [anomalyThreshold]");
@@ -39,43 +43,48 @@ if (args.Length == 0)
 try
 {
     var command = args[0].Trim().ToLowerInvariant();
+
     if (command == "build")
     {
-        if (args.Length < 6)
+        throw new NotSupportedException(
+            "C# product rebuilding has been disabled because bounded-reservoir sampling " +
+            "changes the original PatchCore normal feature space. Export the original " +
+            "Python FAISS memory and DINO banks with deploy/convert_python_product.py."
+        );
+    }
+
+    if (command == "validate-product")
+    {
+        if (args.Length != 3)
             return Usage();
 
         var engineDir = args[1];
-        var outputRoot = args[2];
-        var productName = args[3];
-        var normalDir = args[4];
-        var classes = new List<DefectClassDefinition>();
-
-        foreach (var item in args.Skip(5))
-        {
-            var split = item.IndexOf('=');
-            if (split <= 0 || split >= item.Length - 1)
-                throw new ArgumentException($"Invalid class mapping: {item}. Use class=folder.");
-            classes.Add(new DefectClassDefinition
-            {
-                Name = item[..split],
-                ImageDirectory = item[(split + 1)..],
-            });
-        }
-
+        var productDir = args[2];
         using var featureEngine = new OnnxFeatureEngine(engineDir);
-        var builder = new ProductModelBuilder(featureEngine);
-        var definition = new ProductBuildDefinition
-        {
-            ProductName = productName,
-            NormalImageDirectory = normalDir,
-            DefectClasses = classes,
-        };
+        var product = ProductModel.Load(productDir);
 
-        var manifest = builder.Build(definition, outputRoot, Console.WriteLine);
-        Console.WriteLine();
-        Console.WriteLine($"DONE product={manifest.ProductName}");
-        Console.WriteLine($"memory rows={manifest.PatchCoreMemoryRows}");
-        Console.WriteLine($"classes={string.Join(", ", manifest.Classes)}");
+        if (product.PatchCoreMemory.Cols != featureEngine.Manifest.PatchCore.EmbeddingDim)
+            throw new InvalidDataException(
+                $"PatchCore dimension mismatch: product={product.PatchCoreMemory.Cols}, " +
+                $"engine={featureEngine.Manifest.PatchCore.EmbeddingDim}."
+            );
+        if (product.DefectCls.Cols != featureEngine.Manifest.DINOv2.EmbeddingDim)
+            throw new InvalidDataException(
+                $"DINO dimension mismatch: product={product.DefectCls.Cols}, " +
+                $"engine={featureEngine.Manifest.DINOv2.EmbeddingDim}."
+            );
+
+        Console.WriteLine("PRODUCT MODEL VALID");
+        Console.WriteLine($"product={product.Manifest.ProductName}");
+        Console.WriteLine($"source={product.Manifest.ProductModelSource}");
+        Console.WriteLine($"memory_strategy={product.Manifest.PatchCoreMemoryStrategy}");
+        Console.WriteLine(
+            $"patchcore_memory={product.PatchCoreMemory.Rows}x{product.PatchCoreMemory.Cols}"
+        );
+        Console.WriteLine($"defect_cls={product.DefectCls.Rows}x{product.DefectCls.Cols}");
+        Console.WriteLine($"defect_center={product.DefectCenter.Rows}x{product.DefectCenter.Cols}");
+        Console.WriteLine($"classes={string.Join(", ", product.Manifest.Classes)}");
+        Console.WriteLine($"bbox_relative_threshold={product.Manifest.BboxRelativeThreshold:F3}");
         return 0;
     }
 
