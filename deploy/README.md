@@ -1,14 +1,16 @@
-# Generic ONNX Runtime + Original Python Product Banks
+# ONNX / C# deployment
 
-The deployment architecture is now intentionally split into two parts:
+部署端只负责推理，不负责训练。
+
+最终结构：
 
 ```text
-Generic ONNX engine (export once)
+Generic ONNX engine
 ├── patchcore_feature.onnx
 ├── dinov2_feature.onnx
 └── engine_config.json
 
-Product model (must come from the original Python-trained model)
+Converted product package
 └── <product>/
     ├── patchcore_memory.bin
     ├── defect_cls.bin
@@ -17,42 +19,55 @@ Product model (must come from the original Python-trained model)
     └── conversion_report.json
 ```
 
-**Production C# no longer rebuilds PatchCore memory or DINO exemplar banks.**
-The previous `bounded_reservoir_v1` C# rebuild changed PatchCore's normal feature
-space and therefore could change anomaly scores, anomaly maps, BBoxes, ROIs and
-final DINO classifications.
+正式产品 bank 必须来自原 Python 已训练模型。
 
-The required production flow is:
+---
+
+## 1. 为什么 C# 不再建产品模型
+
+原 Python PatchCore：
 
 ```text
-Training machine / Python
-  original PatchCore
-  → ApproximateGreedyCoresetSampler
-  → original FAISS memory
-
-  original DINO bank
-  → cls/embeddings.npz
-  → center/embeddings.npz
-  → metadata.json
-            ↓
-  deploy/convert_python_product.py
-            ↓
-  patchcore_memory.bin
-  defect_cls.bin
-  defect_center.bin
-  product_model.json
-            ↓
-────────────────────────────────────────────
-Deployment machine / C# / WinForms
-  Python:      NOT REQUIRED
-  PyTorch:     NOT REQUIRED
-  FAISS:       NOT REQUIRED
-  ONNX Runtime + OpenCvSharp only
+normal images
+→ WideResNet50-2
+→ patch embeddings
+→ ApproximateGreedyCoresetSampler
+→ FAISS IndexFlatL2
 ```
 
-## 1. Generic ONNX files
+旧 C# 曾经使用 `bounded_reservoir` 重新采样正常特征，这会改变正常空间，从而改变：
 
-Generated files:
+```text
+PatchCore score
+→ anomaly map
+→ bbox
+→ ROI
+→ DINO class
+```
+
+因此旧的 C# `ProductModelBuilder` 已从仓库删除。
+
+生产端只允许加载：
+
+```text
+ProductModelSource      = python_export
+PatchCoreMemoryStrategy = python_faiss_memory_exact
+```
+
+`ProductModel.Load()` 会拒绝旧 `bounded_reservoir*` 产品包。
+
+---
+
+## 2. 通用 ONNX
+
+导出：
+
+```powershell
+python deploy\export_onnx.py --model patchcore --device cpu --exporter legacy --skip-verify
+python deploy\export_onnx.py --model dinov2 --device cpu --exporter legacy --skip-verify
+```
+
+生成到：
 
 ```text
 deploy/models/
@@ -61,118 +76,121 @@ deploy/models/
 └── engine_config.json
 ```
 
-### PatchCore ONNX interface
+PatchCore：
 
 ```text
-images       float32 [B, 3, 320, 320]
-memory_bank  float32 [M, 1024]
+images       float32 [B,3,320,320]
+memory_bank  float32 [M,1024]
 
-→ patch_embeddings float32 [B, 1600, 1024]
-→ patch_scores     float32 [B, 1600]
+→ patch_embeddings [B,1600,1024]
+→ patch_scores     [B,1600]
 ```
 
-`memory_bank` is supplied at runtime from `patchcore_memory.bin` and must be the
-memory from the original Python FAISS index.
-
-### DINOv2 ONNX interface
+DINOv2：
 
 ```text
-images float32 [B, 3, 224, 224]
+images float32 [B,3,224,224]
 
-→ cls_embedding    float32 [B, 384]
-→ center_embedding float32 [B, 384]
+→ cls_embedding    [B,384]
+→ center_embedding [B,384]
 ```
 
-## 2. Convert the original Python product model
+---
 
-The converter does **not** retrain, resample or re-embed images.
+## 3. 转换原 Python 产品模型
 
-PatchCore:
-
-```text
-nnscorer_search_index.faiss
-→ reconstruct the vectors actually stored in FAISS
-→ verify reconstructed vectors reproduce FAISS nearest-neighbour L2 results
-→ patchcore_memory.bin
-```
-
-DINOv2:
-
-```text
-defect_bank/cls/embeddings.npz
-→ defect_cls.bin
-
-defect_bank/center/embeddings.npz
-→ defect_center.bin
-
-metadata.json
-→ DefectLabels / Classes in product_model.json
-```
-
-Example for the existing phone model:
+示例：
 
 ```powershell
-cd D:\wlenai
-python deploy\convert_python_product.py `
-  --product phone `
-  --patchcore-model-dir D:\wlenai\industrial_anomaly\products\phone\models\patchcore `
-  --defect-bank-dir D:\wlenai\industrial_anomaly\products\phone\models\defect_bank `
-  --output-dir D:\wlenai\deploy\products\phone `
-  --bbox-relative-threshold 0.78 `
-  --roi-margin 0.50 `
+python deploy\convert_python_product.py ^
+  --product phone ^
+  --patchcore-model-dir industrial_anomaly\products\phone\models\patchcore ^
+  --defect-bank-dir industrial_anomaly\products\phone\models\defect_bank ^
+  --output-dir deploy\products\phone ^
+  --bbox-relative-threshold 0.78 ^
+  --roi-margin 0.50 ^
   --copy-support-rois
 ```
 
-Output:
+转换器不会重新训练、重新采样或重新跑 support 图片。
+
+PatchCore：
 
 ```text
-deploy/products/phone/
+nnscorer_search_index.faiss
+→ reconstruct FAISS 中实际保存的 coreset vectors
+→ 验证 nearest-neighbour squared-L2
+→ patchcore_memory.bin
+```
+
+DINO：
+
+```text
+cls/embeddings.npz
+→ defect_cls.bin
+
+center/embeddings.npz
+→ defect_center.bin
+
+metadata.json
+→ labels / classes
+```
+
+输出：
+
+```text
+deploy/products/<product>/
 ├── patchcore_memory.bin
 ├── defect_cls.bin
 ├── defect_center.bin
 ├── product_model.json
 ├── conversion_report.json
-└── support_rois/              # optional
+└── support_rois/
 ```
 
-`product_model.json` records:
+---
+
+## 4. C# Runtime
 
 ```text
-ProductModelSource        = python_export
-PatchCoreMemoryStrategy   = python_faiss_memory_exact
+deploy/csharp/
+├── IndustrialAnomaly.Runtime/
+│   ├── BinaryMatrix.cs
+│   ├── ModelContracts.cs
+│   ├── OnnxFeatureEngine.cs
+│   ├── ProductModel.cs
+│   ├── PatchCoreTiledInspector.cs
+│   └── IndustrialAnomalyEngine.cs
+└── IndustrialAnomaly.Console/
+    └── Program.cs
 ```
 
-The C# runtime rejects the deprecated `bounded_reservoir*` strategy.
+职责：
 
-## 3. Compile C# runtime
+```text
+OnnxFeatureEngine       加载两个 ONNX
+ProductModel            加载原 Python 转换出的三个 bank
+PatchCoreTiledInspector tiled 定位
+IndustrialAnomalyEngine PatchCore → ROI → DINO → 最终结果
+```
+
+编译：
 
 ```powershell
 dotnet build deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -c Release
 ```
 
-Runtime classes:
+---
 
-```text
-OnnxFeatureEngine          generic ONNX sessions
-ProductModel               loads the converted Python banks
-PatchCoreTiledInspector    tiled localization
-IndustrialAnomalyEngine    PatchCore → ROI → DINO → final result
-```
-
-`ProductModelBuilder` is legacy development code and must not be used for
-production model creation.
-
-## 4. Validate the converted product
+## 5. 验证产品包
 
 ```powershell
-dotnet run --no-build -c Release `
-  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
-  validate-product `
-  D:\wlenai\deploy\models `
-  D:\wlenai\deploy\products\phone
+dotnet run --no-build -c Release ^
+  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- ^
+  validate-product deploy\models deploy\products\phone
 ```
 
-Expected fields include:
+应该看到：
 
 ```text
 PRODUCT MODEL VALID
@@ -184,39 +202,35 @@ defect_center=<N>x384
 classes=...
 ```
 
-## 5. Inspect from C#
+---
+
+## 6. C# 检测
+
+单图：
 
 ```powershell
-dotnet run --no-build -c Release `
-  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
-  inspect `
-  D:\wlenai\deploy\models `
-  D:\wlenai\deploy\products\phone `
-  D:\wlenai\data\phone\test\Image_1.bmp `
-  D:\wlenai\deploy\outputs\Image_1_marked.jpg
+dotnet run --no-build -c Release ^
+  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- ^
+  inspect deploy\models deploy\products\phone data\phone\test\Image_1.bmp deploy\outputs\Image_1_marked.jpg
 ```
 
-Folder inspection:
+文件夹：
 
 ```powershell
-dotnet run --no-build -c Release `
-  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
-  inspect-folder `
-  D:\wlenai\deploy\models `
-  D:\wlenai\deploy\products\phone `
-  D:\wlenai\data\phone\test `
-  D:\wlenai\deploy\outputs\phone_test
+dotnet run --no-build -c Release ^
+  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- ^
+  inspect-folder deploy\models deploy\products\phone data\phone\test deploy\outputs\phone_test
 ```
 
-## 6. WinForms integration
+---
 
-WinForms must **load an already converted product model**. It must not rebuild
-PatchCore memory from normal images and must not rebuild DINO banks from support
-images.
+## 7. WinForms integration
+
+WinForms 只导入、验证、激活产品包：
 
 ```csharp
-using var featureEngine = new OnnxFeatureEngine(@"D:\App\engine");
-var product = ProductModel.Load(@"D:\App\products\phone");
+using var featureEngine = new OnnxFeatureEngine(engineDirectory);
+var product = ProductModel.Load(productDirectory);
 var engine = new IndustrialAnomalyEngine(featureEngine, product);
 
 var result = engine.InspectFile(
@@ -226,42 +240,35 @@ var result = engine.InspectFile(
 );
 ```
 
-Recommended product-management UI:
+WinForms 产品管理建议：
 
 ```text
-Import product model folder
-  ↓
-validate ProductModelSource == python_export
-  ↓
-validate memory strategy == python_faiss_memory_exact
-  ↓
-validate dimensions against engine_config.json
-  ↓
-activate product
+导入产品包
+→ validate ProductModelSource
+→ validate MemoryStrategy
+→ validate dimensions
+→ 激活产品
 ```
 
-Do not expose a production button that rebuilds memory/banks locally.
+不要提供“现场训练 PatchCore / 重建 Memory / 重建 DINO Bank”按钮。
 
-## 7. Parity gate before WinForms production acceptance
+---
 
-Using the original Python model and the converted product banks, compare the
-same fixed 320x320 tile step-by-step:
+## 8. Parity gate
+
+正式验收前，对同一固定输入逐级比较原 Python 与 ONNX/C#：
 
 ```text
 1. normalized input tensor
-2. PatchCore patch embedding [1600,1024]
+2. Patch embedding [1600,1024]
 3. nearest-neighbour patch score [1600]
 4. anomaly map
-5. BBox
+5. bbox
 6. DINO CLS [384]
 7. DINO Center [384]
-8. similarity / class
+8. similarity / final class
 ```
 
-The ONNX feature graph is still considered **unaccepted for production** until
-this parity test is completed. Preserving the original Python memory/banks
-removes the known C# reservoir mismatch, but it does not by itself prove the
-hand-rewritten PatchCore ONNX feature graph is numerically equivalent.
+第 2 步不通过时，不要继续靠调 bbox threshold 修结果。
 
-PASS/NG threshold calibration is a separate production-validation task and
-must not be tuned on the final test set.
+当前部署代码应视为“已跑通、待完整 parity 验收”，而不是已经证明与 Python 1:1 等价。
