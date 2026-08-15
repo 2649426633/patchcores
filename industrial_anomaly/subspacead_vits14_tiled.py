@@ -16,35 +16,119 @@ import torchvision.transforms.functional as TF
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
-SUBSPACEAD_SRC = REPO_ROOT / "third_party" / "subspacead" / "src"
-for path in (REPO_ROOT, SUBSPACEAD_SRC):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from app.anomaly.tiled import compute_tile_windows
-from subspacead.core.pca import PCAModel
-from subspacead.post_process.scoring import calculate_anomaly_scores, post_process_map
-from subspacead.utils.common import min_max_norm, topk_mean
-from industrial_anomaly.subspacead_vits14 import (
-    DEFAULT_BLOCKS,
-    DEFAULT_IMAGE_SIZE,
-    PCA_EV,
-    TOP_FRACTION,
-    collect_images,
-    load_pca,
-    make_extractor,
-    resolve_path,
-    save_pca,
+from app.subspacead.dinov2s_extractor import (
+    DINOv2SSubspaceConfig,
+    DINOv2SSubspaceExtractor,
 )
+from app.subspacead.paper_ops import (
+    PCAModel,
+    calculate_anomaly_scores,
+    min_max_norm,
+    post_process_map,
+    topk_mean,
+)
+from app.subspacead.tiling import compute_tile_windows
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+PCA_EV = 0.99
+DEFAULT_IMAGE_SIZE = 448
+DEFAULT_BLOCKS = (7, 8)
+TOP_FRACTION = 0.01
 DEFAULT_TILE_FRACTION = 0.50
 DEFAULT_TILE_OVERLAP = 0.25
 DEFAULT_BATCH_SIZE = 4
 
 
+def resolve_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+def collect_images(path: Path) -> list[Path]:
+    if path.is_file():
+        if path.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise ValueError(f"Unsupported image type: {path}")
+        return [path]
+    if not path.is_dir():
+        raise FileNotFoundError(path)
+    images = sorted(
+        [p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS],
+        key=lambda p: p.name.lower(),
+    )
+    if not images:
+        raise RuntimeError(f"No supported images found in: {path}")
+    return images
+
+
 def default_model_dir(product: str) -> Path:
     return HERE / "products" / product / "models" / "subspacead_vits14_tiled"
+
+
+def make_extractor(
+    *,
+    device: str | None,
+    repo_dir: str,
+    weights_path: str,
+    image_size: int = DEFAULT_IMAGE_SIZE,
+    block_indices: tuple[int, ...] = DEFAULT_BLOCKS,
+) -> DINOv2SSubspaceExtractor:
+    cfg = DINOv2SSubspaceConfig(
+        image_size=int(image_size),
+        block_indices=tuple(int(v) for v in block_indices),
+        repo_dir=repo_dir,
+        weights_path=weights_path,
+    )
+    extractor = DINOv2SSubspaceExtractor(device=device, config=cfg)
+    extractor.load()
+    return extractor
+
+
+def save_pca(model_dir: Path, pca: dict, config: dict) -> None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        model_dir / "pca_model.npz",
+        mu=np.asarray(pca["mu"], dtype=np.float64),
+        components=np.asarray(pca["components"], dtype=np.float64),
+        eigvals=np.asarray(pca["eigvals"], dtype=np.float64),
+        sqrt_eig=np.asarray(pca["sqrt_eig"], dtype=np.float64),
+        k=np.asarray([int(pca["k"])], dtype=np.int64),
+        eps=np.asarray([float(pca["eps"])], dtype=np.float64),
+    )
+    (model_dir / "config.json").write_text(
+        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def load_pca(model_dir: Path) -> tuple[dict, dict]:
+    config_path = model_dir / "config.json"
+    pca_path = model_dir / "pca_model.npz"
+    if not config_path.exists():
+        raise FileNotFoundError(config_path)
+    if not pca_path.exists():
+        raise FileNotFoundError(pca_path)
+
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    data = np.load(pca_path, allow_pickle=False)
+    k = int(np.asarray(data["k"]).reshape(-1)[0])
+    eps = float(np.asarray(data["eps"]).reshape(-1)[0])
+    eigvals = np.asarray(data["eigvals"], dtype=np.float64)
+    pca = {
+        "mu": np.asarray(data["mu"], dtype=np.float64),
+        "components": np.asarray(data["components"], dtype=np.float64),
+        "eigvals": eigvals,
+        "sqrt_eig": np.asarray(data["sqrt_eig"], dtype=np.float64),
+        "k": k,
+        "eps": eps,
+        "whiten": False,
+        "cov_Z_inv": np.diag(1.0 / (eigvals + eps)),
+    }
+    return pca, config
 
 
 def _angles(seed: int, count: int) -> list[float | None]:
@@ -71,7 +155,11 @@ def _iter_batches(items: list, batch_size: int):
 
 def fit_command(args: argparse.Namespace) -> None:
     normal_dir = resolve_path(args.normal_dir)
-    model_dir = resolve_path(args.model_dir) if args.model_dir else default_model_dir(args.product)
+    model_dir = (
+        resolve_path(args.model_dir)
+        if args.model_dir
+        else default_model_dir(args.product)
+    )
     normal_images = collect_images(normal_dir)
     if len(normal_images) < args.shots:
         raise RuntimeError(
@@ -110,7 +198,7 @@ def fit_command(args: argparse.Namespace) -> None:
     )
 
     probe_image = Image.open(selected[0]).convert("RGB")
-    probe_windows, probe_tiles = _tile_batch(
+    _, probe_tiles = _tile_batch(
         probe_image, args.tile_fraction, args.tile_overlap
     )
     probe_tokens = extractor.extract_tokens([probe_tiles[0]])
@@ -123,9 +211,8 @@ def fit_command(args: argparse.Namespace) -> None:
         plan = _angles(args.seed + image_index * 1009, args.aug_count)
         angle_plan[str(path)] = plan
         with Image.open(path) as im:
-            base = im.convert("RGB")
             windows = compute_tile_windows(
-                base.size,
+                im.size,
                 tile_fraction=args.tile_fraction,
                 overlap=args.tile_overlap,
             )
@@ -161,8 +248,13 @@ def fit_command(args: argparse.Namespace) -> None:
                     tokens = extractor.extract_tokens(batch)
                     yield tokens.reshape(-1, feature_dim)
 
-    print("Fitting tiled PCA (two streaming passes)...")
-    pca_model = PCAModel(k=None, ev=PCA_EV, whiten=False)
+    print("Fitting tiled PCA (two streaming passes, no sklearn)...")
+    pca_model = PCAModel(
+        k=None,
+        ev=PCA_EV,
+        whiten=False,
+        device=str(extractor.device),
+    )
     pca = pca_model.fit(
         feature_generator,
         feature_dim=feature_dim,
@@ -195,9 +287,11 @@ def fit_command(args: argparse.Namespace) -> None:
         "tile_overlap": float(args.tile_overlap),
         "tile_merge": "weighted_average",
         "selected_normal_images": [str(p) for p in selected],
+        "runtime": "sklearn_free_industrial_adapter",
         "note": (
-            "Industrial high-resolution extension. The vendored SubspaceAD core is unchanged; "
-            "normal PCA fitting and inference both use identical overlapping tiles."
+            "Industrial high-resolution extension. The vendored SubspaceAD source remains unchanged; "
+            "the adapter implements the same standard PCA reconstruction path without importing "
+            "scikit-learn, avoiding mixed OpenMP runtimes on Windows."
         ),
     }
     save_pca(model_dir, pca, config)
@@ -214,7 +308,6 @@ def _blend_weight(height: int, width: int) -> np.ndarray:
     wy = np.hanning(height).astype(np.float32)
     wx = np.hanning(width).astype(np.float32)
     weight = np.outer(wy, wx)
-    # Keep image borders represented even when a tile touches the full-image edge.
     return np.maximum(weight, 0.05).astype(np.float32)
 
 
@@ -286,7 +379,11 @@ def _save_visuals(
 def inspect_command(args: argparse.Namespace) -> None:
     input_path = resolve_path(args.input)
     images = collect_images(input_path)
-    model_dir = resolve_path(args.model_dir) if args.model_dir else default_model_dir(args.product)
+    model_dir = (
+        resolve_path(args.model_dir)
+        if args.model_dir
+        else default_model_dir(args.product)
+    )
     pca, config = load_pca(model_dir)
 
     if str(config.get("inspection_mode", "")) != "tiled":
@@ -294,12 +391,16 @@ def inspect_command(args: argparse.Namespace) -> None:
             "This command requires a tiled PCA model. Run the tiled 'fit' command first."
         )
 
-    repo_dir = args.dinov2_repo or str(config.get("dinov2_repo", "third_party/dinov2"))
+    repo_dir = args.dinov2_repo or str(
+        config.get("dinov2_repo", "third_party/dinov2")
+    )
     weights = args.weights or str(
         config.get("source_weights", "weights/dinov2_vits14_pretrain.pth")
     )
     image_size = int(config.get("image_size", DEFAULT_IMAGE_SIZE))
-    blocks = tuple(int(v) for v in config.get("local_block_indices", DEFAULT_BLOCKS))
+    blocks = tuple(
+        int(v) for v in config.get("local_block_indices", DEFAULT_BLOCKS)
+    )
     tile_fraction = (
         float(args.tile_fraction)
         if args.tile_fraction is not None
@@ -322,7 +423,11 @@ def inspect_command(args: argparse.Namespace) -> None:
     output_root = (
         resolve_path(args.output_dir)
         if args.output_dir
-        else HERE / "outputs" / args.product / "subspacead_vits14_tiled" / input_path.stem
+        else HERE
+        / "outputs"
+        / args.product
+        / "subspacead_vits14_tiled"
+        / input_path.stem
     )
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -362,13 +467,19 @@ def inspect_command(args: argparse.Namespace) -> None:
                     interpolation=cv2.INTER_LINEAR,
                 )
                 weight = _blend_weight(tile_h, tile_w)
-                merged_sum[window.y1 : window.y2, window.x1 : window.x2] += tile_map * weight
-                merged_weight[window.y1 : window.y2, window.x1 : window.x2] += weight
+                merged_sum[
+                    window.y1 : window.y2, window.x1 : window.x2
+                ] += tile_map * weight
+                merged_weight[
+                    window.y1 : window.y2, window.x1 : window.x2
+                ] += weight
                 tile_records.append(
                     {
                         "tile_index": tile_cursor,
                         "bbox": [window.x1, window.y1, window.x2, window.y2],
-                        "score_top_1pct": float(topk_mean(tile_map_448, frac=TOP_FRACTION)),
+                        "score_top_1pct": float(
+                            topk_mean(tile_map_448, frac=TOP_FRACTION)
+                        ),
                         "patch_score_max": float(np.max(scores)),
                     }
                 )
@@ -386,7 +497,9 @@ def inspect_command(args: argparse.Namespace) -> None:
             args.bbox_relative_threshold,
             args.min_region_area,
         )
-        image_output = output_root if len(images) == 1 else output_root / image_path.stem
+        image_output = (
+            output_root if len(images) == 1 else output_root / image_path.stem
+        )
         raw_path, heat_path, overlay_path = _save_visuals(
             image_path,
             full_map,
@@ -395,7 +508,8 @@ def inspect_command(args: argparse.Namespace) -> None:
             image_score,
         )
         (image_output / "tiles.json").write_text(
-            json.dumps(tile_records, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(tile_records, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
         result = {
@@ -455,7 +569,9 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     fit.set_defaults(func=fit_command)
 
-    inspect = sub.add_parser("inspect", help="Inspect one high-resolution image or folder")
+    inspect = sub.add_parser(
+        "inspect", help="Inspect one high-resolution image or folder"
+    )
     inspect.add_argument("--product", required=True)
     inspect.add_argument("--input", required=True)
     inspect.add_argument("--device", default=None)
@@ -479,11 +595,21 @@ def main() -> None:
         parser.error("--aug-count must be >= 0")
     if hasattr(args, "batch_size") and args.batch_size <= 0:
         parser.error("--batch-size must be > 0")
-    if hasattr(args, "tile_fraction") and args.tile_fraction is not None and not (0.2 <= args.tile_fraction <= 1.0):
+    if (
+        hasattr(args, "tile_fraction")
+        and args.tile_fraction is not None
+        and not (0.2 <= args.tile_fraction <= 1.0)
+    ):
         parser.error("--tile-fraction must be in [0.2,1.0]")
-    if hasattr(args, "tile_overlap") and args.tile_overlap is not None and not (0.0 <= args.tile_overlap < 0.9):
+    if (
+        hasattr(args, "tile_overlap")
+        and args.tile_overlap is not None
+        and not (0.0 <= args.tile_overlap < 0.9)
+    ):
         parser.error("--tile-overlap must be in [0,0.9)")
-    if hasattr(args, "bbox_relative_threshold") and not (0.0 < args.bbox_relative_threshold <= 1.0):
+    if hasattr(args, "bbox_relative_threshold") and not (
+        0.0 < args.bbox_relative_threshold <= 1.0
+    ):
         parser.error("--bbox-relative-threshold must be in (0,1]")
     args.func(args)
 
