@@ -1,86 +1,54 @@
-# Industrial Anomaly — Clean Main Project
+# Python training / validation workflow
 
-正式主流程：
+此目录只负责训练电脑上的 Python 流程。
 
-```text
-正常图 -> PatchCore 无监督训练
-             ↓
-新图 -> PatchCore anomaly regions / ROI
-             ↓
-       Frozen DINOv2
-        ├─ CLS
-        └─ Patch Center
-             ↓
-       Exemplar Bank
-             ↓
-       已知异常类别
-```
-
-仓库根目录假设为 `D:\wlenai`，日常入口位于：
+现在只保留三个主入口：
 
 ```text
-D:\wlenai\industrial_anomaly\
-├── train_patchcore.py
-├── build_defect_bank.py
-├── inspect_image.py
-└── inspect_folder.py
+industrial_anomaly/
+├── train_patchcore.py       # 正常图 → PatchCore + Greedy Coreset + FAISS
+├── build_defect_bank.py     # 已知缺陷 → PatchCore ROI → DINOv2 exemplar bank
+├── inspect.py               # 单图 / 文件夹统一验收
+└── README.md
 ```
 
-所有命令行相对路径都固定以 `D:\wlenai\industrial_anomaly\` 为参考目录。
+## 1. 数据结构
 
-## Phone 高分辨率数据
+数据放仓库根目录 `data/`：
 
 ```text
-D:\wlenai\data\phone\
-├── good\      # 50 正常
-├── shao1\     # 10 已知异常
-├── shao2\     # 10 已知异常
-├── shao3\     # 10 已知异常
-└── test\      # 6 独立测试
+data/<product>/
+├── good/          # 仅正常图
+├── defect_a/      # 已知缺陷类别
+├── defect_b/
+└── test/          # 独立测试图
 ```
 
-### 为什么 phone 使用 tiled 模式
-
-phone 原图约 5472x3648。旧的 `Resize(366) -> CenterCrop(320)` 只观察原图中间区域，左右各约 1100px 完全不会进入 PatchCore，且单 bbox 后处理会丢掉有效的次级异常区域。
-
-`tiled` 模式改为：
+例如：
 
 ```text
-完整原图
-  ↓
-多个重叠方形 tile（默认短边 75%，25% overlap）
-  ↓
-每个 tile 直接 resize 到 320x320
-  ↓
-PatchCore 分别推理
-  ↓
-所有异常连通域映射回原图
-  ↓
-重叠区域合并 / 去重
-  ↓
-R1 / R2 / R3 ... 多异常区域
+data/phone/
+├── good/
+├── shao1/
+├── shao2/
+├── shao3/
+└── test/
 ```
 
-这样既覆盖整图，又比“整图直接压缩到 320”保留更多小缺陷细节。
+## 2. 训练 PatchCore
 
-## Phone 三步命令
-
-先同步最新代码：
+高分辨率工业图推荐 `tiled`：
 
 ```powershell
-cd D:\wlenai
-git fetch origin
-git pull --ff-only origin master
-cd D:\wlenai\industrial_anomaly
+cd industrial_anomaly
+
+python train_patchcore.py ^
+  --product phone ^
+  --normal-dir ..\data\phone\good ^
+  --mode tiled
 ```
 
-### 1. 重新训练 tiled PatchCore
-
-```powershell
-python train_patchcore.py --product phone --normal-dir ..\data\phone\good --mode tiled
-```
-
-默认：
+默认核心参数：
 
 ```text
 imagesize      = 320
@@ -90,67 +58,167 @@ layers         = layer2 + layer3
 coreset        = 0.10
 ```
 
-训练完成后模型目录会额外保存：
+训练流程：
 
 ```text
-products\phone\models\patchcore\inspection_config.json
-```
-
-后续建库和测试会自动读取 `tiled` 模式与 tile 参数。
-
-### 2. 重新建立 shao1 / shao2 / shao3 bank
-
-```powershell
-python build_defect_bank.py --product phone --defects-dir ..\data\phone --classes shao1 shao2 shao3 --shots 10
-```
-
-每张 support 图使用 tiled PatchCore 全图定位，取主异常 ROI 建立 DINOv2 exemplar bank。
-
-### 3. 批量测试 6 张 test
-
-```powershell
-python inspect_folder.py ..\data\phone\test --product phone
+NORMAL images only
+→ WideResNet50-2
+→ PatchCore patch embeddings
+→ ApproximateGreedyCoresetSampler
+→ FAISS IndexFlatL2
 ```
 
 输出：
 
 ```text
-D:\wlenai\industrial_anomaly\outputs\phone\test\
-├── results.csv
-├── results.json
-├── marked\
-│   └── *_marked.jpg          # 原始完整图 + R1/R2/R3 多框 + 类别
-├── rois\
-│   └── *_R1_roi.png ...      # 每个 PatchCore 候选区域
-├── full_heatmaps\
-│   └── *_heatmap.jpg         # 完整原图 tiled heatmap
-└── anomaly_maps\
+products/<product>/models/patchcore/
+├── nnscorer_search_index.faiss
+├── patchcore_params.pkl
+├── patchcore_adapter_config.json
+└── inspection_config.json
 ```
 
-每个候选区域都会单独输出：
+`nnscorer_search_index.faiss` 是部署时必须保留的原始正常 Memory 来源。
+
+## 3. 建立已知缺陷 bank
+
+```powershell
+python build_defect_bank.py ^
+  --product phone ^
+  --defects-dir ..\data\phone ^
+  --classes shao1 shao2 shao3 ^
+  --shots 10
+```
+
+流程：
 
 ```text
-PatchCore region
-bbox（原始图坐标）
-shao1 / shao2 / shao3
-DINOv2 similarity
-margin
+known defect image
+→ 已训练 PatchCore 定位异常
+→ 裁 ROI
+→ frozen DINOv2
+  ├─ CLS
+  └─ Patch Center
+→ exemplar banks
 ```
 
-`results.csv/json` 会保留 `all_regions`，不再只保留一个 bbox。
-
-## 定位调试顺序
-
-如果结果仍不正确，先看：
+输出：
 
 ```text
-outputs\phone\test\full_heatmaps\
+products/<product>/models/defect_bank/
+├── cls/
+│   ├── embeddings.npz
+│   └── metadata.json
+├── center/
+│   ├── embeddings.npz
+│   └── metadata.json
+├── bank_config.json
+└── support_rois/
 ```
 
-- 热图在真实缺陷上，但框不对：后处理/合并问题。
-- 热图完全不在真实缺陷上：PatchCore 特征或 normal 数据覆盖问题。
-- 热图和框都对，但类别错：再处理 DINOv2 分类，不要先调分类器。
+这些 `.npz` 是部署时 `defect_cls.bin` / `defect_center.bin` 的唯一正式来源。
 
-## PASS / NG
+## 4. Python 验收
 
-目前不从 test 标签生成生产 PASS/NG threshold。`--bbox-relative-threshold` 只是定位热区阈值，不是 PASS/NG 阈值。
+现在单图和文件夹统一用 `inspect.py`。
+
+文件夹：
+
+```powershell
+python inspect.py ..\data\phone\test --product phone
+```
+
+单图：
+
+```powershell
+python inspect.py ..\data\phone\test\Image_3.bmp --product phone
+```
+
+脚本会自动读取：
+
+```text
+products/<product>/models/patchcore/inspection_config.json
+```
+
+如果模型是 `tiled`，就自动执行完整 tiled 检测，不再走旧 center-crop 单图分支。
+
+当前推荐定位参数：
+
+```text
+bbox_relative_threshold = 0.78
+tile_fraction           = 0.75
+tile_overlap            = 0.25
+roi_margin              = 0.50
+center_fraction         = 0.50
+```
+
+输出每张图片自己的目录：
+
+```text
+outputs/<product>/<input_name>/
+└── <image>/
+    ├── marked.jpg
+    ├── roi.png
+    ├── heatmap.jpg       # tiled 时
+    └── result.json
+```
+
+文件夹检测还会生成 `results.csv`。
+
+## 5. 调试顺序
+
+结果不对时严格按顺序检查：
+
+```text
+PatchCore heatmap
+    ↓
+BBox
+    ↓
+ROI
+    ↓
+DINO CLS / Center
+    ↓
+Similarity / Class
+```
+
+判断：
+
+- 热图不在真实缺陷：先检查 PatchCore normal 数据、tile 尺度、特征。
+- 热图正确但框不对：检查后处理 / threshold / tile merge。
+- 框正确但类别错：再检查 DINO bank 与 ROI。
+
+不要用分类器问题掩盖前面的定位问题。
+
+## 6. PASS / NG
+
+`--bbox-relative-threshold` 只是**定位阈值**，不是 PASS/NG 阈值。
+
+生产 PASS/NG 阈值必须从独立校准数据获得，不能用最终 `test/` 标签反推。
+
+## 7. 部署到 C# / WinForms
+
+Python 效果确认后，不要让 C# 重新训练。
+
+回仓库根目录运行：
+
+```powershell
+python deploy\convert_python_product.py ^
+  --product phone ^
+  --patchcore-model-dir industrial_anomaly\products\phone\models\patchcore ^
+  --defect-bank-dir industrial_anomaly\products\phone\models\defect_bank ^
+  --output-dir deploy\products\phone ^
+  --bbox-relative-threshold 0.78 ^
+  --roi-margin 0.50 ^
+  --copy-support-rois
+```
+
+部署端只使用转换后的：
+
+```text
+patchcore_memory.bin
+defect_cls.bin
+defect_center.bin
+product_model.json
+```
+
+详细说明见 `../deploy/README.md`。
