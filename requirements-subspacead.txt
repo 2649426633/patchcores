@@ -1,0 +1,4 @@
+# Additional dependencies for the vendored SubspaceAD core.
+# Install torch/torchvision separately to match the CUDA environment.
+transformers
+scikit-learn
