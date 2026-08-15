@@ -1,109 +1,78 @@
-# Generic ONNX Runtime + Dynamic C# Product Models
+# Generic ONNX Runtime + Original Python Product Banks
 
-This deployment layer separates the **generic visual engines** from each
-**product-specific model**.
+The deployment architecture is now intentionally split into two parts:
 
 ```text
-Generic engine (export once)
+Generic ONNX engine (export once)
 ├── patchcore_feature.onnx
 ├── dinov2_feature.onnx
 └── engine_config.json
 
-C# product model (build dynamically)
+Product model (must come from the original Python-trained model)
 └── <product>/
     ├── patchcore_memory.bin
     ├── defect_cls.bin
     ├── defect_center.bin
     ├── product_model.json
-    └── support_rois/
+    └── conversion_report.json
 ```
 
-No product name or defect class is hard-coded into the ONNX models. C# can
-create `phone`, `glass`, `bottle`, or any later product by selecting a normal
-folder and an arbitrary set of `class name -> image folder` mappings.
+**Production C# no longer rebuilds PatchCore memory or DINO exemplar banks.**
+The previous `bounded_reservoir_v1` C# rebuild changed PatchCore's normal feature
+space and therefore could change anomaly scores, anomaly maps, BBoxes, ROIs and
+final DINO classifications.
 
-## Architecture
+The required production flow is:
 
 ```text
-C# normal images
-    ↓ tiled full-image views
-patchcore_feature.onnx
-    ↓ [1600, 1024] patch embeddings / tile
-C# builds product PatchCore memory
-    ↓
-patchcore_memory.bin
+Training machine / Python
+  original PatchCore
+  → ApproximateGreedyCoresetSampler
+  → original FAISS memory
 
-C# known-defect images
-    ↓
-PatchCore ONNX + product memory
-    ↓ anomaly localization / ROI
-DINOv2 ONNX
-    ├── CLS [384]
-    └── Center [384]
-    ↓
-defect_cls.bin + defect_center.bin + labels
-
-New image
-    ↓ tiled PatchCore ONNX + product memory
-    ↓ final anomaly bbox
-DINOv2 ONNX + product defect bank
-    ↓
-final known-defect candidate
+  original DINO bank
+  → cls/embeddings.npz
+  → center/embeddings.npz
+  → metadata.json
+            ↓
+  deploy/convert_python_product.py
+            ↓
+  patchcore_memory.bin
+  defect_cls.bin
+  defect_center.bin
+  product_model.json
+            ↓
+────────────────────────────────────────────
+Deployment machine / C# / WinForms
+  Python:      NOT REQUIRED
+  PyTorch:     NOT REQUIRED
+  FAISS:       NOT REQUIRED
+  ONNX Runtime + OpenCvSharp only
 ```
 
-## 1. Export the two generic ONNX models
+## 1. Generic ONNX files
 
-Requirements already expected by the repository:
+Generated files:
 
 ```text
-D:\wlenai\weights\wide_resnet50_2-95faca4d.pth
-D:\wlenai\weights\dinov2_vits14_pretrain.pth
-D:\wlenai\third_party\dinov2\hubconf.py
-```
-
-Install the export-only packages:
-
-```powershell
-cd D:\wlenai
-python -m pip install -r deploy\requirements.txt
-```
-
-Export and verify:
-
-```powershell
-python deploy\export_onnx.py --device cuda
-```
-
-If CUDA is not wanted for export:
-
-```powershell
-python deploy\export_onnx.py --device cpu
-```
-
-Generated locally (gitignored):
-
-```text
-D:\wlenai\deploy\models\
+deploy/models/
 ├── patchcore_feature.onnx
 ├── dinov2_feature.onnx
 └── engine_config.json
 ```
 
-`export_onnx.py` validates the ONNX files with ONNX Runtime unless
-`--skip-verify` is explicitly supplied.
-
 ### PatchCore ONNX interface
 
 ```text
 images       float32 [B, 3, 320, 320]
-memory_bank  float32 [M, 1024]       # dynamic product memory
+memory_bank  float32 [M, 1024]
 
 → patch_embeddings float32 [B, 1600, 1024]
 → patch_scores     float32 [B, 1600]
 ```
 
-`patch_scores` are minimum squared-L2 distances to the supplied memory bank,
-matching the repository's FAISS `IndexFlatL2` distance definition.
+`memory_bank` is supplied at runtime from `patchcore_memory.bin` and must be the
+memory from the original Python FAISS index.
 
 ### DINOv2 ONNX interface
 
@@ -114,80 +83,112 @@ images float32 [B, 3, 224, 224]
 → center_embedding float32 [B, 384]
 ```
 
-Both DINOv2 outputs are L2-normalized. The center output uses the same 50%
-center-patch pooling used by the Python production path.
+## 2. Convert the original Python product model
 
-## 2. Compile the C# runtime
+The converter does **not** retrain, resample or re-embed images.
 
-The first implementation targets .NET 8 on Windows.
+PatchCore:
+
+```text
+nnscorer_search_index.faiss
+→ reconstruct the vectors actually stored in FAISS
+→ verify reconstructed vectors reproduce FAISS nearest-neighbour L2 results
+→ patchcore_memory.bin
+```
+
+DINOv2:
+
+```text
+defect_bank/cls/embeddings.npz
+→ defect_cls.bin
+
+defect_bank/center/embeddings.npz
+→ defect_center.bin
+
+metadata.json
+→ DefectLabels / Classes in product_model.json
+```
+
+Example for the existing phone model:
 
 ```powershell
 cd D:\wlenai
-dotnet build deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -c Release
+python deploy\convert_python_product.py `
+  --product phone `
+  --patchcore-model-dir D:\wlenai\industrial_anomaly\products\phone\models\patchcore `
+  --defect-bank-dir D:\wlenai\industrial_anomaly\products\phone\models\defect_bank `
+  --output-dir D:\wlenai\deploy\products\phone `
+  --bbox-relative-threshold 0.78 `
+  --roi-margin 0.50 `
+  --copy-support-rois
 ```
 
-The runtime project is:
+Output:
 
 ```text
-deploy\csharp\IndustrialAnomaly.Runtime\
-```
-
-Important classes:
-
-```text
-OnnxFeatureEngine          generic PatchCore + DINOv2 ONNX sessions
-ProductModelBuilder        build a product from user-selected folders
-ProductModel               load saved product banks and classify DINO features
-PatchCoreTiledInspector    full-image tiled anomaly localization
-IndustrialAnomalyEngine    end-to-end final inspection + final mark
-```
-
-## 3. Build a product dynamically from C#
-
-Example with the current phone data:
-
-```powershell
-dotnet run --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
-  build `
-  D:\wlenai\deploy\models `
-  D:\wlenai\deploy\products `
-  phone `
-  D:\wlenai\data\phone\good `
-  shao1=D:\wlenai\data\phone\shao1 `
-  shao2=D:\wlenai\data\phone\shao2 `
-  shao3=D:\wlenai\data\phone\shao3
-```
-
-The class list is completely dynamic. For example, a future product could use:
-
-```text
-scratch=D:\data\new_product\scratch
-crack=D:\data\new_product\crack
-dirty=D:\data\new_product\dirty
-```
-
-without changing or re-exporting either ONNX file.
-
-Output for phone:
-
-```text
-D:\wlenai\deploy\products\phone\
+deploy/products/phone/
 ├── patchcore_memory.bin
 ├── defect_cls.bin
 ├── defect_center.bin
 ├── product_model.json
-└── support_rois\
-    ├── shao1\
-    ├── shao2\
-    └── shao3\
+├── conversion_report.json
+└── support_rois/              # optional
 ```
 
-## 4. Inspect an image from C#
+`product_model.json` records:
 
-Without a calibrated PASS/NG threshold:
+```text
+ProductModelSource        = python_export
+PatchCoreMemoryStrategy   = python_faiss_memory_exact
+```
+
+The C# runtime rejects the deprecated `bounded_reservoir*` strategy.
+
+## 3. Compile C# runtime
 
 ```powershell
-dotnet run --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
+dotnet build deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -c Release
+```
+
+Runtime classes:
+
+```text
+OnnxFeatureEngine          generic ONNX sessions
+ProductModel               loads the converted Python banks
+PatchCoreTiledInspector    tiled localization
+IndustrialAnomalyEngine    PatchCore → ROI → DINO → final result
+```
+
+`ProductModelBuilder` is legacy development code and must not be used for
+production model creation.
+
+## 4. Validate the converted product
+
+```powershell
+dotnet run --no-build -c Release `
+  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
+  validate-product `
+  D:\wlenai\deploy\models `
+  D:\wlenai\deploy\products\phone
+```
+
+Expected fields include:
+
+```text
+PRODUCT MODEL VALID
+source=python_export
+memory_strategy=python_faiss_memory_exact
+patchcore_memory=<rows>x1024
+defect_cls=<N>x384
+defect_center=<N>x384
+classes=...
+```
+
+## 5. Inspect from C#
+
+```powershell
+dotnet run --no-build -c Release `
+  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
   inspect `
   D:\wlenai\deploy\models `
   D:\wlenai\deploy\products\phone `
@@ -195,112 +196,72 @@ dotnet run --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.C
   D:\wlenai\deploy\outputs\Image_1_marked.jpg
 ```
 
-The final marked image contains only the final primary bbox and final result,
-not all intermediate R1/R2/R3 debug candidates.
+Folder inspection:
 
-When an independently calibrated anomaly threshold exists, append it as the
-last argument:
-
-```text
-... Image_1_marked.jpg <threshold>
+```powershell
+dotnet run --no-build -c Release `
+  --project deploy\csharp\IndustrialAnomaly.Console\IndustrialAnomaly.Console.csproj -- `
+  inspect-folder `
+  D:\wlenai\deploy\models `
+  D:\wlenai\deploy\products\phone `
+  D:\wlenai\data\phone\test `
+  D:\wlenai\deploy\outputs\phone_test
 ```
 
-Do not tune a production PASS/NG threshold from the final test images.
+## 6. WinForms integration
 
-## 5. WinForms integration
-
-The Console project is only a validation harness. A WinForms UI can call the
-runtime directly.
-
-Dynamic product definition:
+WinForms must **load an already converted product model**. It must not rebuild
+PatchCore memory from normal images and must not rebuild DINO banks from support
+images.
 
 ```csharp
-using var featureEngine = new OnnxFeatureEngine(@"D:\wlenai\deploy\models");
-var builder = new ProductModelBuilder(featureEngine);
-
-var definition = new ProductBuildDefinition
-{
-    ProductName = "phone",
-    NormalImageDirectory = @"D:\wlenai\data\phone\good",
-    DefectClasses = new[]
-    {
-        new DefectClassDefinition
-        {
-            Name = "shao1",
-            ImageDirectory = @"D:\wlenai\data\phone\shao1"
-        },
-        new DefectClassDefinition
-        {
-            Name = "shao2",
-            ImageDirectory = @"D:\wlenai\data\phone\shao2"
-        },
-        new DefectClassDefinition
-        {
-            Name = "shao3",
-            ImageDirectory = @"D:\wlenai\data\phone\shao3"
-        }
-    }
-};
-
-builder.Build(
-    definition,
-    @"D:\wlenai\deploy\products",
-    message => Console.WriteLine(message)
-);
-```
-
-Inference:
-
-```csharp
-using var featureEngine = new OnnxFeatureEngine(@"D:\wlenai\deploy\models");
-var product = ProductModel.Load(@"D:\wlenai\deploy\products\phone");
+using var featureEngine = new OnnxFeatureEngine(@"D:\App\engine");
+var product = ProductModel.Load(@"D:\App\products\phone");
 var engine = new IndustrialAnomalyEngine(featureEngine, product);
 
 var result = engine.InspectFile(
-    @"D:\wlenai\data\phone\test\Image_1.bmp",
-    @"D:\wlenai\deploy\outputs\Image_1_marked.jpg"
+    imagePath,
+    markedOutputPath,
+    anomalyThreshold: null
 );
 ```
 
-A WinForms layer only needs to collect:
+Recommended product-management UI:
 
 ```text
-ProductName
-NormalImageDirectory
-List<DefectClassDefinition>
+Import product model folder
+  ↓
+validate ProductModelSource == python_export
+  ↓
+validate memory strategy == python_faiss_memory_exact
+  ↓
+validate dimensions against engine_config.json
+  ↓
+activate product
 ```
 
-and pass them into `ProductModelBuilder`.
+Do not expose a production button that rebuilds memory/banks locally.
 
-## Important parity note
+## 7. Parity gate before WinForms production acceptance
 
-The ONNX PatchCore feature graph mirrors the current Python feature pipeline:
+Using the original Python model and the converted product banks, compare the
+same fixed 320x320 tile step-by-step:
 
 ```text
-WideResNet50-2
-→ layer2 + layer3
-→ 3x3 patchify
-→ layer3 spatial alignment to layer2
-→ MeanMapper 1024
-→ Aggregator 1024
+1. normalized input tensor
+2. PatchCore patch embedding [1600,1024]
+3. nearest-neighbour patch score [1600]
+4. anomaly map
+5. BBox
+6. DINO CLS [384]
+7. DINO Center [384]
+8. similarity / class
 ```
 
-Tiled localization, anomaly-map smoothing, connected-component evidence,
-region ranking, IoU merge, ROI margin, DINO CLS/Center pooling and exemplar
-cosine classification are also ported into the C# runtime.
+The ONNX feature graph is still considered **unaccepted for production** until
+this parity test is completed. Preserving the original Python memory/banks
+removes the known C# reservoir mismatch, but it does not by itself prove the
+hand-rewritten PatchCore ONNX feature graph is numerically equivalent.
 
-The one intentional first-version difference is **normal-memory sampling**:
-
-```text
-Python production: ApproximateGreedyCoresetSampler
-C# deployment v1: bounded streaming reservoir sampling
-```
-
-C# uses a bounded streaming strategy so a user can build models from large
-high-resolution datasets without first holding every `[N,1024]` patch vector in
-RAM. `product_model.json` records the strategy as `bounded_reservoir_v1`.
-
-Therefore the C# runtime should be treated as a deployment baseline until the
-Python-vs-ONNX-vs-C# parity test is run on the same normal/support/test images.
-The next validation step is to compare PatchCore embeddings/scores, final bbox,
-DINO embeddings and final class on the existing phone dataset.
+PASS/NG threshold calibration is a separate production-validation task and
+must not be tuned on the final test set.
