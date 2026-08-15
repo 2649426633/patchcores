@@ -23,6 +23,7 @@ def setup_logging(outdir: str, save_log: bool = True):
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(console_handler)
 
+    # File handler
     if save_log:
         log_file = os.path.join(outdir, "run.log")
         file_handler = logging.FileHandler(log_file)
@@ -50,6 +51,7 @@ def min_max_norm(
 ) -> torch.Tensor | np.ndarray:
     """Performs min-max normalization on a tensor or numpy array."""
     is_torch = torch.is_tensor(x)
+
     if is_torch:
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         x_min = torch.amin(x, dim=(-1, -2), keepdim=True)
