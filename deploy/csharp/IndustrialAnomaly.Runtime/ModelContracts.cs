@@ -3,12 +3,20 @@ using System.Text.Json.Serialization;
 
 namespace IndustrialAnomaly.Runtime;
 
+[Obsolete(
+    "C# product rebuilding is disabled for production parity. Convert the original Python PatchCore/DINO banks with deploy/convert_python_product.py instead.",
+    true
+)]
 public sealed record DefectClassDefinition
 {
     public required string Name { get; init; }
     public required string ImageDirectory { get; init; }
 }
 
+[Obsolete(
+    "C# product rebuilding is disabled for production parity. Convert the original Python PatchCore/DINO banks with deploy/convert_python_product.py instead.",
+    true
+)]
 public sealed record ProductBuildDefinition
 {
     public required string ProductName { get; init; }
@@ -118,8 +126,9 @@ public sealed record NormalizationManifest
 
 public sealed record ProductModelManifest
 {
-    public int FormatVersion { get; init; } = 1;
+    public int FormatVersion { get; init; } = 2;
     public required string ProductName { get; init; }
+    public string ProductModelSource { get; init; } = "unknown";
     public required string PatchCoreMemoryFile { get; init; }
     public required string DefectClsFile { get; init; }
     public required string DefectCenterFile { get; init; }
@@ -129,7 +138,7 @@ public sealed record ProductModelManifest
     public float TileOverlap { get; init; }
     public float CoresetRatio { get; init; }
     public int PatchCoreMemoryRows { get; init; }
-    public string PatchCoreMemoryStrategy { get; init; } = "bounded_reservoir";
+    public string PatchCoreMemoryStrategy { get; init; } = "unknown";
     public float BboxRelativeThreshold { get; init; }
     public float RoiMargin { get; init; }
     public float ClsWeight { get; init; }
